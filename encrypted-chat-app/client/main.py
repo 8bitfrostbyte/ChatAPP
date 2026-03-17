@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QFileDialog, QScrollArea, QInputDialog, QSplitter,
     QColorDialog, QSpinBox, QCheckBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QStandardPaths
 from PyQt6.QtGui import QIcon, QPixmap, QFont, QFontDatabase
 from PyQt6.QtGui import QDesktopServices
 
@@ -836,7 +836,7 @@ class ChatWindow(QMainWindow):
         self._room_list_snapshot = []
         self._rooms_data: Dict[int, dict] = {}  # room_id -> {is_private, created_by}
         self._room_select_epoch = 0
-        self.settings_path = Path(__file__).parent / "user_settings.json"
+        self.settings_path = self._resolve_settings_path()
         self._theme: Dict = copy.deepcopy(_THEME_DEFAULTS)
         self._load_user_settings()
         
@@ -1838,6 +1838,31 @@ class ChatWindow(QMainWindow):
                     "!addtags <tag1,tag2> | !removetags <tag1,tag2|count> | !taglist | !cleartags | "
                     "!blacklist [list|add <tags>|remove <tags>|clear] | !saveimages [folder_path]"
                 )
+                return
+
+            if bang_action == "taglist":
+                taglist_arg = bang_rest.strip()
+                if not taglist_arg or taglist_arg.lower() == "list":
+                    self.handle_bot_command("!bot tags list")
+                    return
+
+                tag_parts = taglist_arg.split(maxsplit=1)
+                tag_action = tag_parts[0].lower()
+                tag_payload = tag_parts[1].strip() if len(tag_parts) > 1 else ""
+
+                if tag_action == "clear":
+                    self.handle_bot_command("!bot tags clear")
+                    return
+
+                if tag_action in {"add", "addtags", "remove", "removetags"}:
+                    if not tag_payload:
+                        self.append_system_message("Usage: !taglist add|addtags <tags> | !taglist remove|removetags <tags>|<count> | !taglist clear")
+                        return
+                    normalized_action = "add" if tag_action in {"add", "addtags"} else "remove"
+                    self.handle_bot_command(f"!bot tags {normalized_action} {tag_payload}")
+                    return
+
+                self.append_system_message("Usage: !taglist [list|add|addtags <tags>|remove|removetags <tags>|<count>|clear]")
                 return
 
             shorthand_map = {
@@ -3090,6 +3115,18 @@ class ChatWindow(QMainWindow):
         outer.addWidget(close_btn)
         dialog.setLayout(outer)
         dialog.exec()
+        # Persist any already-applied theme/sound changes when settings closes.
+        self._save_user_settings()
+
+    def _resolve_settings_path(self) -> Path:
+        """Return a writable per-user settings path (works for source runs and packaged EXE)."""
+        app_data = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        if app_data:
+            settings_dir = Path(app_data)
+        else:
+            settings_dir = Path.home() / ".encrypted-chat"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        return settings_dir / "user_settings.json"
 
     def _load_user_settings(self):
         """Load persisted client-side settings."""
@@ -3159,6 +3196,7 @@ class ChatWindow(QMainWindow):
     
     def closeEvent(self, event):
         """Handle window close."""
+        self._save_user_settings()
         if self.current_room:
             # Best effort to announce offline state when app closes.
             room_id = self.current_room

@@ -656,6 +656,37 @@ async def clearblacklist(ctx):
     await ctx.send(f"🧹 **Blacklist Cleared.** Removed `{cleared_count}` blacklisted tags.")
 
 @bot.command()
+async def clear(ctx, amount: int = None):
+    if amount is None:
+        await ctx.send("Usage: `!clear <number>` - Deletes that many messages from the channel.")
+        return
+    
+    if amount <= 0:
+        await ctx.send("Please specify a positive number of messages to delete.")
+        return
+    
+    if amount > 100:
+        await ctx.send("Cannot delete more than 100 messages at once (Discord API limit).")
+        return
+    
+    try:
+        # Collect exactly 'amount' messages from history
+        messages_to_delete = []
+        async for message in ctx.channel.history(limit=amount):
+            messages_to_delete.append(message)
+        
+        # Delete the collected messages
+        if messages_to_delete:
+            await ctx.channel.delete_messages(messages_to_delete)
+        
+        feedback = await ctx.send(f"🗑 **Deleted `{len(messages_to_delete)}` messages.**")
+        await asyncio.sleep(3)
+        await feedback.delete()
+    except Exception as e:
+        await ctx.send(f"Error deleting messages: {e}")
+
+
+@bot.command()
 async def stop(ctx):
     image_stream.stop()
     with _buffer_lock:
@@ -768,6 +799,7 @@ async def commands_list(ctx):
         "- `!removeblacklist tag1, tag2` - Remove blacklist tags\n"
         "- `!blacklist` - Show blacklist tags\n"
         "- `!clearblacklist` - Clear blacklist tags\n"
+        "- `!clear <number>` - Delete that many messages from channel\n"
         "- `!searchtags <query>` - Search tag names across APIs\n"
         "- `!commands` - Show this command list"
     )
