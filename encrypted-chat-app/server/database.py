@@ -5,6 +5,7 @@ Database models for the encrypted chat application.
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Table, LargeBinary, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
+from typing import Generator
 from datetime import datetime
 import os
 
@@ -142,7 +143,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 
-def get_db() -> Session:
+def get_db() -> Generator[Session, None, None]:
     """Get database session for dependency injection."""
     db = SessionLocal()
     try:

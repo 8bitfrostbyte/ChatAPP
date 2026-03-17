@@ -70,6 +70,21 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def ensure_room_encryption_key(db: Session, room: Room) -> bytes:
+    """Ensure room has a persistent encryption key in DB and loaded in memory."""
+    if room.encryption_key:
+        key_bytes = bytes(room.encryption_key)
+        encryption_manager.set_room_key(room.id, key_bytes)
+        return key_bytes
+
+    key_text = encryption_manager.generate_room_key(room.id)
+    key_bytes = key_text.encode()
+    room.encryption_key = key_bytes
+    db.commit()
+    db.refresh(room)
+    return key_bytes
+
+
 class BotStreamManager:
     """Manages interval-based bot image streams per room."""
 
@@ -255,8 +270,10 @@ async def startup():
         db.commit()
         db.refresh(room_one)
 
-    # Ensure there is an in-memory encryption key for the default room.
-    encryption_manager.generate_room_key(room_one.id)
+    # Ensure every room has a persistent key and load into memory.
+    all_rooms = db.query(Room).all()
+    for room in all_rooms:
+        ensure_room_encryption_key(db, room)
     db.close()
 
 
@@ -380,7 +397,10 @@ async def create_room(
     db: Session = Depends(get_db)
 ):
     """Create a new room."""
-    user, error = auth_manager.verify_token(db, authorization.split(" ")[1] if authorization else "")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    user, error = auth_manager.verify_token(db, authorization.split(" ")[1])
     if error:
         raise HTTPException(status_code=401, detail=error)
     
@@ -392,7 +412,7 @@ async def create_room(
     db.add(room)
     db.commit()
     db.refresh(room)
-    encryption_manager.generate_room_key(room.id)
+    ensure_room_encryption_key(db, room)
 
     # Creator is automatically a member so private rooms are usable right away.
     creator_member = db.query(RoomMember).filter(
@@ -752,8 +772,7 @@ async def clear_room_messages(
 ):
     """Clear recent messages in a room.
 
-    - Room creator can clear any recent user/bot/image messages.
-    - Non-creator can clear only their own recent messages.
+    Any room member can clear recent non-system messages.
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
@@ -780,9 +799,6 @@ async def clear_room_messages(
         Message.message_type != "system"
     )
 
-    if room.created_by != user.id:
-        query = query.filter(Message.user_id == user.id)
-
     target_messages = query.order_by(Message.created_at.desc()).limit(count).all()
 
     if not target_messages:
@@ -805,7 +821,7 @@ async def clear_room_messages(
     return {
         "deleted": len(deleted_ids),
         "message": f"Cleared {len(deleted_ids)} message(s)",
-        "scope": "room" if room.created_by == user.id else "own"
+        "scope": "room"
     }
 
 

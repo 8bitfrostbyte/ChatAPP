@@ -461,6 +461,7 @@ class WebSocketThread(QThread):
     user_joined = pyqtSignal(dict)
     user_left = pyqtSignal(dict)
     typing_received = pyqtSignal(dict)
+    message_deleted = pyqtSignal(dict)
     connection_closed = pyqtSignal()
     
     def __init__(self, server_url: str, token: str, room_id: int):
@@ -482,6 +483,7 @@ class WebSocketThread(QThread):
             self.client.set_on_user_joined(lambda data: self.user_joined.emit(data))
             self.client.set_on_user_left(lambda data: self.user_left.emit(data))
             self.client.set_on_typing(lambda data: self.typing_received.emit(data))
+            self.client.set_on_message_deleted(lambda data: self.message_deleted.emit(data))
             
             self.loop.run_until_complete(self.client.connect())
             self.loop.run_forever()
@@ -863,15 +865,14 @@ class ChatWindow(QMainWindow):
 
         is_self = username == self.api_client.username
         align = "right" if is_self else "left"
-        bubble = "#2d5f57" if is_self else "#273349"
         name_color = "#8df2d4" if is_self else "#9bc3ff"
+        text_color = "#d8f1ec" if is_self else "#dde8f8"
 
         return (
             f'<div style="text-align:{align};margin:4px 0;">'
             f'<span style="color:#8da0b9;font-size:11px;">[{timestamp}] </span>'
             f'<span style="color:{name_color};font-weight:700;">{username}</span><br>'
-            f'<span style="display:inline-block;background:{bubble};padding:6px 10px;border-radius:10px;">'
-            f'{safe_content}</span>'
+            f'<span style="color:{text_color};">{safe_content}</span>'
             f'</div>'
         )
 
@@ -992,12 +993,36 @@ class ChatWindow(QMainWindow):
         if not content:
             return
 
-        if content.startswith("!commands") or content.startswith("!commands"):
+        if content.startswith("!commands"):
             self.show_room_commands()
             self.message_input.clear()
             return
 
-        if content.startswith("!botcommand") or content.startswith("!botcommand"):
+        if content.startswith("!clear"):
+            parts = content.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip().isdigit():
+                self.append_system_message("Usage: !clear <count>")
+                self.message_input.clear()
+                return
+
+            count = int(parts[1].strip())
+            if count <= 0:
+                self.append_system_message("Usage: !clear <count> (count must be > 0)")
+                self.message_input.clear()
+                return
+
+            success, result = self.api_client.clear_room_messages(self.current_room, count)
+            if not success:
+                self.append_system_message(f"Clear failed: {result}")
+                self.message_input.clear()
+                return
+
+            self.append_system_message(result.get("message", "Messages cleared"))
+            self.load_messages()
+            self.message_input.clear()
+            return
+
+        if content.startswith("!botcommand") or content.startswith("!botcommands"):
             self.show_bot_commands()
             self.message_input.clear()
             return
@@ -1030,7 +1055,9 @@ class ChatWindow(QMainWindow):
             "!createroom <name> [private] - Create a new room",
             "!removeroom <name|id> - Delete a room (creator-only)",
             "!makeprivate - Make current room private (creator-only)",
-            "!clear <count> - Clear recent messages (creator clears room, others clear own)",
+            "!clear <count> - Clear recent non-system messages in this room",
+            "!room clear <count> - Alias for clearing recent room messages",
+            "!botcommands - Show bot command list",
             "/room list - List available rooms",
             "/room create <name> [private] - Create a new room",
             "/room delete <name|id> - Delete a room",
@@ -1051,7 +1078,9 @@ class ChatWindow(QMainWindow):
             "!removetags <tag1,tag2> - Remove tags from saved pool",
             "!taglist - Show saved tags",
             "!cleartags - Clear all saved tags",
+            "!botcommands - Show this bot command list",
             "!bot search <tags> - Search for images",
+            "!searchtags <query> - Detailed tag search (botUpdated-style)",
             "!bot image <tags> - Fetch single image",
             "!bot blacklist show|add|remove - Manage blacklist"
         ]
@@ -1086,11 +1115,14 @@ class ChatWindow(QMainWindow):
                 "resume":     lambda: self.handle_bot_command("!bot resume"),
                 "status":     lambda: self.handle_bot_command("!bot status"),
                 "commands":   lambda: self.handle_bot_command("!bot commands"),
+                "botcommand": lambda: self.handle_bot_command("!bot commands"),
+                "botcommands": lambda: self.handle_bot_command("!bot commands"),
                 "addtags":    lambda: self.handle_bot_command(f"!bot tags add {bang_rest}".strip()),
                 "removetags": lambda: self.handle_bot_command(f"!bot tags remove {bang_rest}".strip()),
                 "taglist":    lambda: self.handle_bot_command("!bot tags list"),
                 "cleartags":  lambda: self.handle_bot_command("!bot tags clear"),
                 "search":     lambda: self.handle_bot_command(f"!bot search {bang_rest}".strip()),
+                "searchtags": lambda: self.handle_bot_command(f"!bot searchtags {bang_rest}".strip()),
                 "image":      lambda: self.handle_bot_command(f"!bot image {bang_rest}".strip()),
                 "blacklist":  lambda: self.handle_bot_command(f"!bot blacklist {bang_rest}".strip()),
                 "tags":       lambda: self.handle_bot_command(f"!bot tags {bang_rest}".strip()),
@@ -1102,7 +1134,7 @@ class ChatWindow(QMainWindow):
 
             self.append_system_message(
                 "Unknown command. Available: !start !stop !pause !resume !status "
-                "!search !image !addtags !removetags !taglist !cleartags !blacklist"
+                "!search !searchtags !image !addtags !removetags !taglist !cleartags !blacklist !botcommands"
             )
             return
 
@@ -1110,7 +1142,7 @@ class ChatWindow(QMainWindow):
         if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() in {"help", "commands"}):
             self.append_system_message(
                 "Bot commands: !bot start <seconds> [tags] | !bot pause | !bot resume | !bot stop | !bot status | !bot commands | "
-                "!bot search <query> | !bot image <tags> | "
+                "!bot search <query> | !bot searchtags <query> | !bot image <tags> | "
                 "!bot tags list|add <tags>|remove <tags>|clear | "
                 "!bot blacklist show | !bot blacklist add <tag1,tag2> | !bot blacklist remove <tag1,tag2>"
             )
@@ -1258,23 +1290,58 @@ class ChatWindow(QMainWindow):
             self.append_system_message("Usage: !bot tags list|add <tags>|remove <tags>|clear")
             return
 
-        if not arg and action in {"search", "image", "blacklist"}:
+        if not arg and action in {"search", "searchtags", "image", "blacklist"}:
             self.append_system_message("Invalid bot command. Use !bot help")
             return
 
-        if action == "search":
+        if action in {"search", "searchtags"}:
             success, result = self.api_client.search_tags(arg)
             if not success:
                 self.append_system_message(f"Bot search failed: {result}")
                 return
 
-            combined = result.get("combined", [])[:8]
+            combined = result.get("combined", [])
             if not combined:
-                self.append_system_message(f"No bot tag results for '{arg}'.")
+                self.append_system_message(f"No tags found for '{result.get('query', arg)}'.")
                 return
 
-            summary = ", ".join(f"{item.get('name')}({item.get('count', 0)})" for item in combined)
-            self.append_system_message(f"Bot search '{arg}': {summary}")
+            query_tag = result.get("query", arg.strip().lower().replace(" ", "_"))
+
+            # Always present exact input tag first when present, then sort remaining by total images.
+            combined_sorted = sorted(
+                combined,
+                key=lambda item: (-int(item.get("count", 0) or 0), str(item.get("name", "")))
+            )
+            exact_match = next((item for item in combined_sorted if item.get("name") == query_tag), None)
+            remaining = [item for item in combined_sorted if item.get("name") != query_tag]
+            exact_count = int(exact_match.get("count", 0) or 0) if exact_match else 0
+            exact_entry = {
+                "name": query_tag,
+                "count": exact_count,
+                "rule34_count": int((result.get("rule34") or {}).get(query_tag, 0) or 0),
+                "danbooru_count": int((result.get("danbooru") or {}).get(query_tag, 0) or 0),
+            }
+            ordered = [exact_entry] + remaining
+            total_combined = sum(int(item.get("count", 0) or 0) for item in combined_sorted)
+
+            self.append_system_message(
+                f"Tag Search: {query_tag} | Combined Image Count (R34+Danbooru): {total_combined} | "
+                f"Exact Tag Images: {exact_count} | Rule34: {len(result.get('rule34', {}))} | "
+                f"Danbooru: {len(result.get('danbooru', {}))} | Listed Tags: {len(combined_sorted)}"
+            )
+
+            # Compact list format: trap(11061), trap_on_trap(8009), ...
+            entries = [f"{item.get('name')}({int(item.get('count', 0) or 0)})" for item in ordered]
+            chunk = ""
+            for entry in entries:
+                candidate = f"{chunk}, {entry}" if chunk else entry
+                if len(candidate) > 1400:
+                    self.append_system_message(chunk)
+                    chunk = entry
+                else:
+                    chunk = candidate
+            if chunk:
+                self.append_system_message(chunk)
             return
 
         if action == "image":
@@ -1452,7 +1519,7 @@ class ChatWindow(QMainWindow):
         if cmd.startswith("!room"):
             parts = cmd.split(maxsplit=3)
             if len(parts) < 2:
-                self.append_system_message("Room commands: !room list | !room create <name> [private] | !room delete <name|id> | !room makeprivate")
+                self.append_system_message("Room commands: !room list | !room create <name> [private] | !room delete <name|id> | !room makeprivate | !room clear <count>")
                 return
 
             action = parts[1].lower()
@@ -1472,6 +1539,13 @@ class ChatWindow(QMainWindow):
                 self.handle_room_command("!makeprivate")
                 return
 
+            if action == "clear":
+                if len(parts) < 3:
+                    self.append_system_message("Usage: !room clear <count>")
+                    return
+                self.send_room_clear(parts[2].strip())
+                return
+
             if action in {"delete", "remove"}:
                 if len(parts) < 3:
                     self.append_system_message("Usage: !room delete <name|id>")
@@ -1480,10 +1554,26 @@ class ChatWindow(QMainWindow):
                 self.handle_room_command(f"!removeroom {room_part}")
                 return
 
-            self.append_system_message("Room commands: /room list | /room create <name> [private] | /room delete <name|id> | /room makeprivate")
+            self.append_system_message("Room commands: !room list | !room create <name> [private] | !room delete <name|id> | !room makeprivate | !room clear <count>")
             return
 
         self.append_system_message("Unknown room command. Use !createroom or !removeroom")
+
+    def send_room_clear(self, count_text: str):
+        """Execute room clear command from shared parser path."""
+        if not count_text.isdigit():
+            self.append_system_message("Usage: !clear <count>")
+            return
+        count = int(count_text)
+        if count <= 0:
+            self.append_system_message("Usage: !clear <count> (count must be > 0)")
+            return
+        success, result = self.api_client.clear_room_messages(self.current_room, count)
+        if not success:
+            self.append_system_message(f"Clear failed: {result}")
+            return
+        self.append_system_message(result.get("message", "Messages cleared"))
+        self.load_messages()
     
     def upload_image(self):
         """Upload an image to the current room."""
@@ -1520,6 +1610,7 @@ class ChatWindow(QMainWindow):
         self.websocket_thread.user_joined.connect(self.on_user_joined)
         self.websocket_thread.user_left.connect(self.on_user_left)
         self.websocket_thread.typing_received.connect(self.on_typing)
+        self.websocket_thread.message_deleted.connect(self.on_message_deleted)
         self.websocket_thread.start()
     
     def on_message_received(self, data: dict):
@@ -1553,6 +1644,10 @@ class ChatWindow(QMainWindow):
     def on_typing(self, data: dict):
         """Handle typing indicator."""
         pass  # Could show "User is typing..."
+
+    def on_message_deleted(self, data: dict):
+        """Handle message deletion broadcast by reloading room history."""
+        self.load_messages()
     
     def _update_members(self, members: list):
         """Update the members list widget (must be called on main thread)."""

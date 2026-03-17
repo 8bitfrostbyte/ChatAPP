@@ -98,6 +98,8 @@ class ImageBot:
         if not name or not q:
             return False
 
+        # Token-boundary matching only: exact, q_*, *_q, *_q_*.
+        # This intentionally excludes unrelated prefix matches like strap for trap.
         if name == q:
             return True
         if name.startswith(f"{q}_"):
@@ -106,7 +108,7 @@ class ImageBot:
             return True
         if f"_{q}_" in name:
             return True
-        return name.startswith(q)
+        return False
 
     def load_blacklist(self):
         """Load blacklist from file if it exists."""
@@ -232,7 +234,28 @@ class ImageBot:
         if self.config.start_tags:
             return {"mode": "saved", "tag_pool": sorted(self.config.start_tags), "saved": False}
 
-        return {"mode": "random", "tag_pool": ["rating:explicit"], "saved": False}
+        # Keep empty tag_pool for true random mode; fetch layer applies robust fallbacks.
+        return {"mode": "random", "tag_pool": [], "saved": False}
+
+    def _effective_tag_pool(self, tag_pool: List[str]) -> List[str]:
+        """Resolve final fetch tags; broaden no-tag random mode for better hit rate."""
+        cleaned = [t.strip() for t in (tag_pool or []) if t and t.strip()]
+        if cleaned:
+            # If a single broad query tag is provided, add top matched concrete tags.
+            if len(cleaned) == 1:
+                seed = cleaned[0]
+                try:
+                    search = self.search_tags(seed, limit=12)
+                    for item in search.get("combined", [])[:4]:
+                        name = str(item.get("name", "")).strip()
+                        if name and name not in cleaned:
+                            cleaned.append(name)
+                except Exception:
+                    pass
+            return cleaned
+
+        # No explicit tags: attempt common pools across both APIs.
+        return ["rating:explicit", "1girl", "solo"]
 
     def get_matching_blacklist_tags(self, tags) -> List[str]:
         """Get blacklist tags that match the given tags."""
@@ -364,6 +387,100 @@ class ImageBot:
 
         return counts
 
+    def _search_danbooru_tag_directory(self, query: str, limit: int = 120) -> Dict[str, int]:
+        """Fallback: query Danbooru tag directory directly by name prefix."""
+        counts = {}
+        auth = None
+        if self.config.danbooru_username and self.config.danbooru_api_key:
+            auth = (self.config.danbooru_username, self.config.danbooru_api_key)
+
+        params = {
+            "search[name_matches]": f"{query}*",
+            "search[order]": "count",
+            "limit": min(max(limit, 20), 200),
+        }
+        try:
+            response = curi_requests.get(
+                "https://danbooru.donmai.us/tags.json",
+                params=params,
+                auth=auth,
+                impersonate="chrome110",
+                timeout=15,
+            )
+            if response.status_code != 200:
+                return counts
+
+            data = response.json()
+            if not isinstance(data, list):
+                return counts
+
+            for entry in data:
+                name = str(entry.get("name", "")).strip().lower()
+                if not name or not self.matches_search_query(name, query):
+                    continue
+                counts[name] = max(counts.get(name, 0), self._to_int(entry.get("post_count", 0), 0))
+        except Exception:
+            return counts
+
+        return counts
+
+    def _search_rule34_wildcard_tags(self, query: str, limit: int = 50) -> Dict[str, int]:
+        """Fallback: wildcard-style Rule34 post search to expand matches."""
+        counts = {}
+
+        def fetch_page(pid):
+            page_counts = {}
+            params = {
+                "page": "dapi",
+                "s": "post",
+                "q": "index",
+                "json": 1,
+                "limit": 100,
+                "pid": pid,
+                "tags": f"{query}*",
+            }
+            if self.config.rule34_user_id and self.config.rule34_api_key:
+                params["user_id"] = self.config.rule34_user_id
+                params["api_key"] = self.config.rule34_api_key
+
+            try:
+                response = requests.get(
+                    "https://api.rule34.xxx",
+                    params=params,
+                    headers=self.config.headers,
+                    timeout=12,
+                )
+                if response.status_code != 200:
+                    return page_counts
+
+                data = response.json()
+                if not isinstance(data, list):
+                    return page_counts
+
+                for post in data:
+                    post_tags = {
+                        tag.strip().lower()
+                        for tag in str(post.get("tags", "")).split()
+                        if tag.strip()
+                    }
+                    for tag in post_tags:
+                        if not self.matches_search_query(tag, query):
+                            continue
+                        page_counts[tag] = page_counts.get(tag, 0) + 1
+            except Exception:
+                return page_counts
+
+            return page_counts
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(fetch_page, pid) for pid in range(0, 4)]
+            for future in as_completed(futures):
+                page_counts = future.result()
+                for tag, value in page_counts.items():
+                    counts[tag] = counts.get(tag, 0) + value
+
+        return counts
+
     def _get_rule34_association_count(self, base_tag: str, related_tag: str):
         tags = base_tag if base_tag == related_tag else f"{base_tag} {related_tag}"
         params = {
@@ -430,6 +547,17 @@ class ImageBot:
         rule34_tags = self._search_rule34_tags(normalized, limit=limit)
         danbooru_tags = self._search_danbooru_tags(normalized, limit=limit)
 
+        # Fallbacks from original bot behavior: broaden search if direct post scans are empty/low.
+        if len(rule34_tags) < 3:
+            wildcard_rule34 = self._search_rule34_wildcard_tags(normalized, limit=limit)
+            for name, count in wildcard_rule34.items():
+                rule34_tags[name] = max(rule34_tags.get(name, 0), count)
+
+        if len(danbooru_tags) < 3:
+            direct_danbooru = self._search_danbooru_tag_directory(normalized, limit=max(limit, 80))
+            for name, count in direct_danbooru.items():
+                danbooru_tags[name] = max(danbooru_tags.get(name, 0), count)
+
         sample_sorted = sorted(
             set(rule34_tags.keys()) | set(danbooru_tags.keys()),
             key=lambda name: (-(rule34_tags.get(name, 0) + danbooru_tags.get(name, 0)), name),
@@ -484,48 +612,63 @@ class ImageBot:
     def _fetch_one_tag(self, tag_param: str, limit: int = 100) -> List[Dict]:
         """Fetch posts for a single tag from Rule34 and Danbooru."""
         results = []
+        query_tag = (tag_param or "").strip()
 
         # Rule34
         try:
-            params = {
-                "page": "dapi",
-                "s": "post",
-                "q": "index",
-                "json": 1,
-                "limit": limit,
-                "pid": random.randint(0, 50),
-                "tags": tag_param,
-            }
-            if self.config.rule34_user_id and self.config.rule34_api_key:
-                params["user_id"] = self.config.rule34_user_id
-                params["api_key"] = self.config.rule34_api_key
+            for _ in range(3):
+                params = {
+                    "page": "dapi",
+                    "s": "post",
+                    "q": "index",
+                    "json": 1,
+                    "limit": limit,
+                    "pid": random.randint(0, 80),
+                }
+                if query_tag:
+                    params["tags"] = query_tag
+                if self.config.rule34_user_id and self.config.rule34_api_key:
+                    params["user_id"] = self.config.rule34_user_id
+                    params["api_key"] = self.config.rule34_api_key
 
-            response = requests.get(
-                "https://api.rule34.xxx",
-                params=params,
-                headers=self.config.headers,
-                timeout=15,
-            )
-            if response.status_code == 200:
+                response = requests.get(
+                    "https://api.rule34.xxx",
+                    params=params,
+                    headers=self.config.headers,
+                    timeout=15,
+                )
+                if response.status_code != 200:
+                    continue
+
                 data = response.json()
-                if isinstance(data, list):
-                    for post in data:
-                        post_tags = post.get("tags", "")
-                        if self.get_matching_blacklist_tags(post_tags):
-                            continue
-                        url = post.get("file_url")
-                        if url:
-                            results.append({"url": url, "tags": post_tags, "api": "rule34", "query_tag": tag_param})
+                if not isinstance(data, list):
+                    continue
+
+                for post in data:
+                    post_tags = post.get("tags", "")
+                    if self.get_matching_blacklist_tags(post_tags):
+                        continue
+                    url = post.get("file_url")
+                    if url:
+                        results.append({
+                            "url": url,
+                            "tags": post_tags,
+                            "api": "rule34",
+                            "query_tag": query_tag or "random"
+                        })
+                if results:
+                    break
         except Exception as e:
-            log_verbose(f"Buffer fetch error rule34 ({tag_param}): {e}")
+            log_verbose(f"Buffer fetch error rule34 ({query_tag or 'random'}): {e}")
 
         # Danbooru
         try:
             params = {
-                "tags": tag_param,
                 "limit": min(limit, 100),
                 "random": "true",
             }
+            if query_tag:
+                params["tags"] = query_tag
             auth = None
             if self.config.danbooru_username and self.config.danbooru_api_key:
                 auth = (self.config.danbooru_username, self.config.danbooru_api_key)
@@ -546,9 +689,14 @@ class ImageBot:
                             continue
                         url = post.get("file_url") or post.get("large_file_url")
                         if url:
-                            results.append({"url": url, "tags": post_tags, "api": "danbooru", "query_tag": tag_param})
+                            results.append({
+                                "url": url,
+                                "tags": post_tags,
+                                "api": "danbooru",
+                                "query_tag": query_tag or "random"
+                            })
         except Exception as e:
-            log_verbose(f"Buffer fetch error danbooru ({tag_param}): {e}")
+            log_verbose(f"Buffer fetch error danbooru ({query_tag or 'random'}): {e}")
 
         return results
 
@@ -556,9 +704,7 @@ class ImageBot:
         """Fetch posts for all tags in parallel and push into shared buffer."""
         self._refill_in_progress = True
         try:
-            tags = [t.strip() for t in (tag_pool or []) if t and t.strip()]
-            if not tags:
-                tags = ["rating:explicit"]
+            tags = self._effective_tag_pool(tag_pool)
 
             new_posts = []
             workers = max(1, min(len(tags), 8))
@@ -596,9 +742,7 @@ class ImageBot:
 
     def fetch_buffered_image(self, tag_pool: List[str]) -> Optional[Dict]:
         """Fetch one non-duplicate image using a buffered pipeline."""
-        normalized_pool = [t.strip() for t in (tag_pool or []) if t and t.strip()]
-        if not normalized_pool:
-            normalized_pool = ["rating:explicit"]
+        normalized_pool = self._effective_tag_pool(tag_pool)
 
         signature = tuple(sorted(normalized_pool))
         with self._buffer_lock:
@@ -639,7 +783,13 @@ class ImageBot:
         query_tag = tags.strip() if tags and tags.strip() else "rating:explicit"
         target_limit = max(1, int(limit))
 
-        results = self._fetch_one_tag(query_tag, limit=min(max(target_limit * 8, 20), 100))
+        batch_limit = min(max(target_limit * 8, 20), 100)
+        candidate_tags = self._effective_tag_pool([query_tag])
+        results = []
+        for candidate in candidate_tags:
+            results.extend(self._fetch_one_tag(candidate, limit=batch_limit))
+            if len(results) >= target_limit * 3:
+                break
         random.shuffle(results)
 
         deduped = []

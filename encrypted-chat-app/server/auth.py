@@ -4,6 +4,7 @@ Authentication module for user registration and login.
 
 import bcrypt
 import secrets
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from sqlalchemy.orm import Session
@@ -40,6 +41,7 @@ class AuthManager:
     """Handles user authentication, registration, and session management."""
     
     SESSION_DURATION = timedelta(hours=24)  # Sessions expire after 24 hours
+    USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{3,50}$")
     
     @staticmethod
     def hash_password(password: str) -> str:
@@ -58,23 +60,28 @@ class AuthManager:
         Register a new user.
         Returns: (user, error_message) - error_message is None if successful
         """
+        normalized_username = (username or "").strip()
+        password = password or ""
+
+        # Validate username format early.
+        if not AuthManager.USERNAME_RE.fullmatch(normalized_username):
+            return None, "Username must be 3-50 chars and contain only letters, numbers, _ or -"
+
         # Check if user already exists
-        existing_user = db.query(User).filter(User.username == username).first()
+        existing_user = db.query(User).filter(User.username == normalized_username).first()
         if existing_user:
             return None, "Username already exists"
-        
-        # Validate username length
-        if len(username) < 3 or len(username) > 50:
-            return None, "Username must be between 3 and 50 characters"
-        
+
         # Validate password length
-        if len(password) < 6:
-            return None, "Password must be at least 6 characters"
+        if len(password) < 8:
+            return None, "Password must be at least 8 characters"
+        if len(password) > 256:
+            return None, "Password is too long"
         
         # Create new user
         password_hash = AuthManager.hash_password(password)
         new_user = User(
-            username=username,
+            username=normalized_username,
             password_hash=password_hash
         )
         
@@ -90,6 +97,9 @@ class AuthManager:
         Authenticate a user and create a session.
         Returns: (session, error_message) - error_message is None if successful
         """
+        username = (username or "").strip()
+        password = password or ""
+
         # Find user
         user = db.query(User).filter(User.username == username).first()
         if not user:

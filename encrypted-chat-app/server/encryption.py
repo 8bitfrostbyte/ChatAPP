@@ -44,8 +44,8 @@ class EncryptionManager:
             cipher = self.get_room_key(room_id)
             decrypted = cipher.decrypt(encrypted_message.encode())
             return decrypted.decode()
-        except Exception as e:
-            raise ValueError(f"Decryption failed: {str(e)}")
+        except Exception:
+            raise ValueError("Decryption failed")
     
     def derive_password_key(self, password: str, salt: bytes = None) -> tuple:
         """Derive an encryption key from a password using PBKDF2."""
@@ -56,7 +56,8 @@ class EncryptionManager:
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
-            iterations=100000,
+            # Stronger KDF work factor for password-protected operations.
+            iterations=390000,
         )
         key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
         return key, salt

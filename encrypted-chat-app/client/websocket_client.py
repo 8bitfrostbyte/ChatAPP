@@ -22,6 +22,7 @@ class WebSocketClient:
         self.on_user_joined_callback: Optional[Callable] = None
         self.on_user_left_callback: Optional[Callable] = None
         self.on_typing_callback: Optional[Callable] = None
+        self.on_message_deleted_callback: Optional[Callable] = None
         self.loop = None
         self.receive_task = None
     
@@ -40,6 +41,10 @@ class WebSocketClient:
     def set_on_typing(self, callback: Callable):
         """Set callback for typing indicators."""
         self.on_typing_callback = callback
+
+    def set_on_message_deleted(self, callback: Callable):
+        """Set callback for message deletions."""
+        self.on_message_deleted_callback = callback
     
     async def connect(self):
         """Connect to the WebSocket server."""
@@ -99,7 +104,8 @@ class WebSocketClient:
                 self.on_typing_callback(data)
         
         elif msg_type == "message_deleted":
-            print(f"Message {data.get('message_id')} was deleted")
+            if self.on_message_deleted_callback:
+                self.on_message_deleted_callback(data)
     
     async def send_message(self, content: str):
         """Send a text message."""
