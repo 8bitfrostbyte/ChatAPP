@@ -2,7 +2,7 @@
 Database models for the encrypted chat application.
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Table, LargeBinary
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Table, LargeBinary, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from datetime import datetime
@@ -73,7 +73,7 @@ class RoomMember(Base):
     user = relationship("User", back_populates="room_members")
     
     __table_args__ = (
-        {"unique": True},  # Ensure user can only join a room once
+        UniqueConstraint("room_id", "user_id", name="uq_room_members_room_user"),
     )
     
     def __repr__(self):
