@@ -4,26 +4,90 @@ PyQt6-based user interface for Windows.
 """
 
 import sys
+import copy
 import asyncio
 import json
 import requests
+import base64
+import html
+import re
+import time
 from typing import Optional, List, Dict
-from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QListWidget, QListWidgetItem, QLineEdit, QPushButton,
     QTextEdit, QTextBrowser, QLabel, QMessageBox, QDialog, QDialogButtonBox,
-    QComboBox, QFileDialog, QScrollArea, QInputDialog, QSplitter
+    QComboBox, QFileDialog, QScrollArea, QInputDialog, QSplitter,
+    QColorDialog, QSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QIcon, QPixmap, QFont
 from PyQt6.QtGui import QDesktopServices
 
-import requests
 from websocket_client import WebSocketClient
 from notification_handler import NotificationHandler
+
+# ---------------------------------------------------------------------------
+# Theme system
+# ---------------------------------------------------------------------------
+_THEME_DEFAULTS: Dict = {
+    "window_bg":      "#141a24",
+    "panel_bg":       "#1d2533",
+    "border_color":   "#2f3d54",
+    "text_color":     "#e8edf5",
+    "button_bg":      "#244063",
+    "button_border":  "#33547c",
+    "button_text":    "#edf3ff",
+    "font_family":    "",
+    "font_size":      13,
+    "msg_own_name":   "#8df2d4",
+    "msg_other_name": "#9bc3ff",
+    "msg_own_text":   "#d8f1ec",
+    "msg_other_text": "#dde8f8",
+    "system_color":   "#9aa8ba",
+}
+
+_THEME_PRESETS: Dict = {
+    "Dark (Default)": {
+        "window_bg": "#141a24", "panel_bg": "#1d2533", "border_color": "#2f3d54",
+        "text_color": "#e8edf5", "button_bg": "#244063", "button_border": "#33547c",
+        "button_text": "#edf3ff", "msg_own_name": "#8df2d4", "msg_other_name": "#9bc3ff",
+        "msg_own_text": "#d8f1ec", "msg_other_text": "#dde8f8", "system_color": "#9aa8ba",
+        "font_family": "", "font_size": 13,
+    },
+    "PowerShell": {
+        "window_bg": "#012456", "panel_bg": "#001232", "border_color": "#1a3f6f",
+        "text_color": "#eeedf0", "button_bg": "#003080", "button_border": "#1a5096",
+        "button_text": "#ffffff", "msg_own_name": "#ffff00", "msg_other_name": "#00dfff",
+        "msg_own_text": "#eeedf0", "msg_other_text": "#eeedf0", "system_color": "#aaaaaa",
+        "font_family": "Consolas", "font_size": 13,
+    },
+    "Light": {
+        "window_bg": "#f0f2f5", "panel_bg": "#ffffff", "border_color": "#c8d0de",
+        "text_color": "#1a2030", "button_bg": "#dce8f8", "button_border": "#a8c0d8",
+        "button_text": "#1a2a40", "msg_own_name": "#007a60", "msg_other_name": "#2060a8",
+        "msg_own_text": "#1a3330", "msg_other_text": "#1a2a44", "system_color": "#667088",
+        "font_family": "", "font_size": 13,
+    },
+    "Midnight Blue": {
+        "window_bg": "#0a0e1a", "panel_bg": "#10162a", "border_color": "#1c2540",
+        "text_color": "#c8d8f0", "button_bg": "#1a2848", "button_border": "#2a3f68",
+        "button_text": "#d8e8ff", "msg_own_name": "#60e8b0", "msg_other_name": "#60b0ff",
+        "msg_own_text": "#b8e8d8", "msg_other_text": "#c0d4f0", "system_color": "#7080a0",
+        "font_family": "", "font_size": 13,
+    },
+    "Forest Green": {
+        "window_bg": "#0d1a0d", "panel_bg": "#142014", "border_color": "#1e3c1e",
+        "text_color": "#d0ead0", "button_bg": "#1a3c1a", "button_border": "#285228",
+        "button_text": "#d8f4d8", "msg_own_name": "#80ff80", "msg_other_name": "#60c890",
+        "msg_own_text": "#b8e8b8", "msg_other_text": "#c0dcc0", "system_color": "#709070",
+        "font_family": "", "font_size": 13,
+    },
+}
 
 
 class APIClient:
@@ -178,6 +242,21 @@ class APIClient:
                 return True, response.json()
             else:
                 return False, response.json().get("detail", "Failed to leave room")
+        except Exception as e:
+            return False, str(e)
+
+    def invite_user(self, room_id: int, username: str) -> tuple:
+        """Invite a user to a room (creator only)."""
+        try:
+            response = requests.post(
+                f"{self.server_url}/api/rooms/{room_id}/invite",
+                params={"username": username},
+                headers=self._get_headers(),
+                timeout=5
+            )
+            if response.status_code == 200:
+                return True, response.json()
+            return False, response.json().get("detail", "Failed to invite user")
         except Exception as e:
             return False, str(e)
     
@@ -634,6 +713,14 @@ class ChatWindow(QMainWindow):
         self.websocket_thread = None
         self.notification_handler = NotificationHandler(self)
         self.sidebar_collapsed = False
+        self._image_cache = {}
+        self._chat_raw_messages = []
+        self._last_presence_message = None
+        self._last_presence_at = 0.0
+        self._rooms_data: Dict[int, dict] = {}  # room_id -> {is_private, created_by}
+        self.settings_path = Path(__file__).parent / "user_settings.json"
+        self._theme: Dict = copy.deepcopy(_THEME_DEFAULTS)
+        self._load_user_settings()
         
         self.setWindowTitle("Encrypted Chat")
         self.setGeometry(100, 100, 1000, 600)
@@ -646,9 +733,14 @@ class ChatWindow(QMainWindow):
         
         # Main layout
         main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
         # Header row
+        header_widget = QWidget()
+        header_widget.setMinimumHeight(0)
         header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(4, 4, 4, 2)
         self.user_label = QLabel("User: not logged in")
         self.user_label.setObjectName("HeaderUserLabel")
         self.server_label = QLabel(f"Server: {self.server_url}")
@@ -656,10 +748,16 @@ class ChatWindow(QMainWindow):
         header_layout.addWidget(self.user_label)
         header_layout.addStretch(1)
         header_layout.addWidget(self.server_label)
-        main_layout.addLayout(header_layout)
+        header_widget.setLayout(header_layout)
 
         # Content layout with resizable splitter
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Allow dragging chat pane to full width by collapsing sibling pane.
+        self.main_splitter.setChildrenCollapsible(True)
+        self.main_splitter.setCollapsible(0, True)
+        self.main_splitter.setCollapsible(1, True)
+        self.main_splitter.setHandleWidth(8)
+        self.main_splitter.setOpaqueResize(True)
         
         # Left sidebar - Rooms
         self.sidebar_widget = QWidget()
@@ -700,49 +798,83 @@ class ChatWindow(QMainWindow):
         left_layout.addWidget(self.members_list)
 
         self.sidebar_widget.setLayout(left_layout)
+        self.sidebar_widget.setMinimumWidth(0)
         
         # Right side - Chat
         chat_widget = QWidget()
+        chat_widget.setMinimumWidth(0)
         right_layout = QVBoxLayout()
         right_layout.setContentsMargins(0, 0, 0, 0)
         
         # Room name
         self.room_name_label = QLabel("Select a room")
         self.room_name_label.setObjectName("RoomTitleLabel")
-        right_layout.addWidget(self.room_name_label)
+        self.room_name_label.setMinimumHeight(0)
         
-        # Messages
+        # Messages + composer in a vertical splitter so the chat pane is draggable.
+        self.chat_splitter = QSplitter(Qt.Orientation.Vertical)
+        # Allow dragging message area to full height by collapsing composer pane.
+        self.chat_splitter.setChildrenCollapsible(True)
+        self.chat_splitter.setCollapsible(0, True)
+        self.chat_splitter.setCollapsible(1, True)
+        self.chat_splitter.setHandleWidth(8)
+        self.chat_splitter.setOpaqueResize(True)
+
         self.message_display = QTextBrowser()
+        self.message_display.setMinimumHeight(0)
         self.message_display.setReadOnly(True)
         self.message_display.setOpenExternalLinks(False)
         self.message_display.anchorClicked.connect(self.open_message_link)
-        right_layout.addWidget(self.message_display)
-        
-        # Message input
+        self.chat_splitter.addWidget(self.message_display)
+
+        composer_widget = QWidget()
+        composer_widget.setMinimumHeight(0)
+        composer_layout = QVBoxLayout()
+        composer_layout.setContentsMargins(0, 0, 0, 0)
+
         self.message_input = QLineEdit()
         self.message_input.returnPressed.connect(self.send_message)
-        right_layout.addWidget(self.message_input)
-        
-        # Button layout
+        composer_layout.addWidget(self.message_input)
+
         button_layout = QHBoxLayout()
-        
+
         send_btn = QPushButton("Send")
         send_btn.clicked.connect(self.send_message)
         button_layout.addWidget(send_btn)
-        
+
         upload_btn = QPushButton("Upload Image")
         upload_btn.clicked.connect(self.upload_image)
         button_layout.addWidget(upload_btn)
-        
+
         settings_btn = QPushButton("Settings")
         settings_btn.clicked.connect(self.show_settings)
         button_layout.addWidget(settings_btn)
-        
+
         logout_btn = QPushButton("Logout")
         logout_btn.clicked.connect(self.logout)
         button_layout.addWidget(logout_btn)
-        
-        right_layout.addLayout(button_layout)
+
+        composer_layout.addLayout(button_layout)
+        composer_widget.setLayout(composer_layout)
+        self.chat_splitter.addWidget(composer_widget)
+        self.chat_splitter.setStretchFactor(0, 1)
+        self.chat_splitter.setStretchFactor(1, 0)
+        self.chat_splitter.setSizes([520, 120])
+
+        # Top-edge drag support for message area (drag handle above messages).
+        self.chat_area_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.chat_area_splitter.setChildrenCollapsible(True)
+        self.chat_area_splitter.setCollapsible(0, True)
+        self.chat_area_splitter.setCollapsible(1, True)
+        self.chat_area_splitter.setHandleWidth(8)
+        self.chat_area_splitter.setOpaqueResize(True)
+        self.chat_area_splitter.addWidget(self.room_name_label)
+        self.chat_area_splitter.addWidget(self.chat_splitter)
+        self.chat_area_splitter.setStretchFactor(0, 0)
+        self.chat_area_splitter.setStretchFactor(1, 1)
+        self.chat_area_splitter.setSizes([34, 606])
+
+        right_layout.addWidget(self.chat_area_splitter)
 
         chat_widget.setLayout(right_layout)
 
@@ -752,7 +884,20 @@ class ChatWindow(QMainWindow):
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([280, 720])
 
-        main_layout.addWidget(self.main_splitter)
+        # Global vertical splitter enables dragging from top edge too (collapse header).
+        self.window_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.window_splitter.setChildrenCollapsible(True)
+        self.window_splitter.setCollapsible(0, True)
+        self.window_splitter.setCollapsible(1, True)
+        self.window_splitter.setHandleWidth(8)
+        self.window_splitter.setOpaqueResize(True)
+        self.window_splitter.addWidget(header_widget)
+        self.window_splitter.addWidget(self.main_splitter)
+        self.window_splitter.setStretchFactor(0, 0)
+        self.window_splitter.setStretchFactor(1, 1)
+        self.window_splitter.setSizes([28, 572])
+
+        main_layout.addWidget(self.window_splitter)
         central_widget.setLayout(main_layout)
         
         # Prevent WorkerThread instances from being garbage-collected mid-run
@@ -774,69 +919,88 @@ class ChatWindow(QMainWindow):
             return True
         return False
 
-    def apply_dark_theme(self):
-        """Apply a custom dark theme for the app."""
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget {
-                background-color: #141a24;
-                color: #e8edf5;
-            }
-            QLabel#HeaderUserLabel, QLabel#HeaderServerLabel {
-                color: #8fa7c7;
+    def _build_stylesheet(self) -> str:
+        """Build a QSS stylesheet string from the current theme dict."""
+        t = self._theme
+        ff = t.get("font_family", "")
+        fs = int(t.get("font_size", 13))
+        font_widget = f"font-family: '{ff}';" if ff else ""
+        font_text   = (f"font-family: '{ff}';" if ff else "") + f" font-size: {fs}px;"
+        hover_btn   = t.get("button_border", "#33547c")
+        pressed_btn = t.get("window_bg", "#141a24")
+        return f"""
+            QMainWindow, QWidget {{
+                background-color: {t['window_bg']};
+                color: {t['text_color']};
+                {font_widget}
+            }}
+            QLabel#HeaderUserLabel, QLabel#HeaderServerLabel {{
+                color: {t['system_color']};
                 font-size: 11px;
-            }
-            QLabel#SectionLabel {
-                color: #d6e1f2;
+            }}
+            QLabel#SectionLabel {{
+                color: {t['text_color']};
                 font-size: 13px;
                 font-weight: 600;
-            }
-            QLabel#RoomTitleLabel {
-                color: #f2f6ff;
+            }}
+            QLabel#RoomTitleLabel {{
+                color: {t['text_color']};
                 font-size: 16px;
                 font-weight: 700;
                 padding: 4px 2px;
-            }
-            QListWidget, QTextEdit, QLineEdit {
-                background-color: #1d2533;
-                border: 1px solid #2f3d54;
+            }}
+            QListWidget, QTextEdit, QLineEdit {{
+                background-color: {t['panel_bg']};
+                border: 1px solid {t['border_color']};
                 border-radius: 8px;
                 padding: 6px;
-                color: #e8edf5;
-                selection-background-color: #2f4f7a;
-            }
-            QPushButton {
-                background-color: #244063;
-                border: 1px solid #33547c;
+                color: {t['text_color']};
+                selection-background-color: {t['button_bg']};
+                {font_text}
+            }}
+            QPushButton {{
+                background-color: {t['button_bg']};
+                border: 1px solid {t['button_border']};
                 border-radius: 8px;
                 padding: 7px 10px;
-                color: #edf3ff;
+                color: {t['button_text']};
                 font-weight: 600;
-            }
-            QPushButton:hover {
-                background-color: #2d4f78;
-            }
-            QPushButton:pressed {
-                background-color: #1f3b5b;
-            }
-            QPushButton#SidebarToggleBtn {
+            }}
+            QPushButton:hover {{
+                background-color: {hover_btn};
+            }}
+            QPushButton:pressed {{
+                background-color: {pressed_btn};
+            }}
+            QPushButton#SidebarToggleBtn {{
                 min-width: 88px;
-            }
-            QSplitter::handle {
-                background-color: #2f3d54;
-                width: 3px;
-            }
-            QScrollBar:vertical {
-                background: #18202d;
+            }}
+            QSplitter::handle {{
+                background-color: {t['border_color']};
+                width: 8px;
+                height: 8px;
+            }}
+            QSplitter::handle:hover {{
+                background-color: {t['button_bg']};
+            }}
+            QScrollBar:vertical {{
+                background: {t['window_bg']};
                 width: 10px;
                 margin: 2px;
-            }
-            QScrollBar::handle:vertical {
-                background: #2f4f7a;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {t['button_bg']};
                 border-radius: 5px;
-            }
-            """
-        )
+            }}
+        """
+
+    def _apply_theme(self):
+        """Rebuild and apply the QSS stylesheet from current theme settings."""
+        self.setStyleSheet(self._build_stylesheet())
+
+    def apply_dark_theme(self):
+        """Apply initial theme (uses persisted or default settings)."""
+        self._apply_theme()
 
     def toggle_sidebar(self):
         """Collapse/expand the left sidebar."""
@@ -844,41 +1008,231 @@ class ChatWindow(QMainWindow):
         self.sidebar_widget.setVisible(not self.sidebar_collapsed)
         self.toggle_sidebar_btn.setText("Expand" if self.sidebar_collapsed else "Collapse")
 
-    def format_message_html(self, username: str, content: str, msg_type: str = "text") -> str:
+    def _extract_image_urls(self, content: str) -> List[str]:
+        return re.findall(r'https?://[^\s]+\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s]*)?', content, re.IGNORECASE)
+
+    def _save_images_from_chat(self, folder_path: Optional[str] = None) -> tuple:
+        """Save all image URLs from currently loaded chat messages to a local folder."""
+        if not folder_path:
+            folder_path = QFileDialog.getExistingDirectory(self, "Select folder to save images")
+            if not folder_path:
+                return False, "Canceled"
+
+        target_dir = Path(folder_path)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        image_urls = []
+        for msg in self._chat_raw_messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("msg_type") == "system":
+                continue
+            content = str(msg.get("content", ""))
+            image_urls.extend(self._extract_image_urls(content))
+
+        # Preserve order while removing duplicates.
+        unique_urls = list(dict.fromkeys(image_urls))
+        if not unique_urls:
+            return False, "No image URLs found in current chat view"
+
+        saved_count = 0
+        failed_count = 0
+
+        for index, url in enumerate(unique_urls, start=1):
+            try:
+                parsed = urlparse(url)
+                basename = Path(parsed.path).name or f"image_{index}.jpg"
+                name = Path(basename).stem or f"image_{index}"
+                ext = Path(basename).suffix.lower() or ".jpg"
+                if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                    ext = ".jpg"
+
+                file_path = target_dir / f"{index:03d}_{name}{ext}"
+                response = requests.get(url, timeout=15)
+                response.raise_for_status()
+                file_path.write_bytes(response.content)
+                saved_count += 1
+            except Exception:
+                failed_count += 1
+
+        if saved_count == 0:
+            return False, "Failed to download images"
+
+        return True, {
+            "saved": saved_count,
+            "failed": failed_count,
+            "folder": str(target_dir),
+        }
+
+    def _cache_image_url(self, url: str) -> Optional[str]:
+        """Fetch one image and return in-memory data URI for embedding (no disk writes)."""
+        if url in self._image_cache:
+            return self._image_cache[url]
+
+        try:
+            response = requests.get(url, timeout=8)
+            response.raise_for_status()
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            mime_type = "image/jpeg"
+            if "png" in content_type:
+                mime_type = "image/png"
+            elif "gif" in content_type:
+                mime_type = "image/gif"
+            elif "webp" in content_type:
+                mime_type = "image/webp"
+            elif "jpeg" in content_type or "jpg" in content_type:
+                mime_type = "image/jpeg"
+
+            encoded = base64.b64encode(response.content).decode("ascii")
+            data_uri = f"data:{mime_type};base64,{encoded}"
+            self._image_cache[url] = data_uri
+            return data_uri
+        except Exception:
+            return None
+
+    def _build_message_body_html(self, content: str, embedded_sources: Optional[Dict[str, str]] = None) -> str:
+        """Build message body with text first and images under it, matching Discord-like layout."""
+        embedded_sources = embedded_sources or {}
+        image_urls = self._extract_image_urls(content)
+
+        text_html = html.escape(content)
+        for url in image_urls:
+            text_html = text_html.replace(html.escape(url), "")
+
+        text_html = re.sub(r'\n{3,}', '\n\n', text_html).strip()
+        text_html = text_html.replace("\n", "<br>")
+
+        # Preserve clickable non-image links inside text.
+        text_html = re.sub(
+            r'(https?://[^\s<]+)',
+            r'<a href="\1" style="color:#7fb4ff;text-decoration:none;word-break:break-all;">\1</a>',
+            text_html,
+            flags=re.IGNORECASE,
+        )
+
+        images_html = []
+        for url in image_urls:
+            src = embedded_sources.get(url)
+            if src:
+                images_html.append(
+                    f'<img src="{src}" style="max-width:420px;max-height:320px;'
+                    f'border-radius:6px;display:block;margin:8px 0;">'
+                )
+            else:
+                images_html.append(
+                    f'<a href="{url}" style="color:#7fb4ff;text-decoration:none;word-break:break-all;">{html.escape(url)}</a>'
+                )
+
+        if text_html and images_html:
+            return f"{text_html}<br>{''.join(images_html)}"
+        if images_html:
+            return "".join(images_html)
+        return text_html
+
+    def _is_presence_system_message(self, content: str, msg_type: str) -> bool:
+        """Return True for system presence lines like '<user> is online/offline'."""
+        if msg_type != "system":
+            return False
+        return bool(re.match(r"^.+\s+is\s+(online|offline)$", (content or "").strip(), flags=re.IGNORECASE))
+
+    def _is_duplicate_presence_message(self, content: str, msg_type: str) -> bool:
+        """Suppress repeated identical presence lines emitted multiple times in quick succession."""
+        if not self._is_presence_system_message(content, msg_type):
+            return False
+
+        now = time.time()
+        normalized = (content or "").strip().lower()
+        is_dup = (
+            self._last_presence_message == normalized
+            and (now - self._last_presence_at) < 3.0
+        )
+
+        self._last_presence_message = normalized
+        self._last_presence_at = now
+        return is_dup
+
+    def _dedupe_presence_history(self, messages: List[dict]) -> List[dict]:
+        """Collapse consecutive duplicate presence system lines in historical message loads."""
+        filtered = []
+        last_presence_key = None
+
+        for msg in messages:
+            msg_type = str(msg.get("message_type", "text"))
+            content = str(msg.get("content", "")).strip()
+
+            if self._is_presence_system_message(content, msg_type):
+                key = content.lower()
+                if key == last_presence_key:
+                    continue
+                last_presence_key = key
+            else:
+                last_presence_key = None
+
+            filtered.append(msg)
+
+        return filtered
+
+    def format_message_html(self, username: str, body_html: str, msg_type: str = "text") -> str:
         """Render a styled chat line with timestamp and role-specific colors."""
         timestamp = datetime.now().strftime("%H:%M")
-        safe_content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        if "http://" in safe_content or "https://" in safe_content:
-            for token in safe_content.split():
-                if token.startswith("http://") or token.startswith("https://"):
-                    safe_content = safe_content.replace(
-                        token,
-                        f'<a href="{token}" style="color:#7fb4ff;text-decoration:none;">{token}</a>'
-                    )
+        t = self._theme
+        ff = t.get("font_family", "")
+        fs = int(t.get("font_size", 13))
+        font_style = (f"font-family:'{ff}';" if ff else "") + f"font-size:{fs}px;"
 
         if msg_type == "system":
             return (
-                f'<div style="margin:2px 0;color:#9aa8ba;font-style:italic;">'
-                f'[{timestamp}] [SYSTEM] {safe_content}</div>'
+                f'<div style="margin:2px 0;color:{t["system_color"]};font-style:italic;{font_style}">'
+                f'[{timestamp}] [SYSTEM] {body_html}</div>'
             )
 
         is_self = username == self.api_client.username
         align = "right" if is_self else "left"
-        name_color = "#8df2d4" if is_self else "#9bc3ff"
-        text_color = "#d8f1ec" if is_self else "#dde8f8"
+        name_color = t["msg_own_name"] if is_self else t["msg_other_name"]
+        text_color = t["msg_own_text"] if is_self else t["msg_other_text"]
 
         return (
             f'<div style="text-align:{align};margin:4px 0;">'
-            f'<span style="color:#8da0b9;font-size:11px;">[{timestamp}] </span>'
+            f'<span style="color:{t["system_color"]};font-size:11px;">[{timestamp}] </span>'
             f'<span style="color:{name_color};font-weight:700;">{username}</span><br>'
-            f'<span style="color:{text_color};">{safe_content}</span>'
+            f'<span style="color:{text_color};{font_style}">{body_html}</span>'
             f'</div>'
         )
 
     def append_chat_message(self, username: str, content: str, msg_type: str = "text"):
         """Append one formatted message to the chat display."""
-        self.message_display.append(self.format_message_html(username, content, msg_type))
+        if self._is_duplicate_presence_message(content, msg_type):
+            return
+
+        self._chat_raw_messages.append({
+            "username": username,
+            "content": content,
+            "msg_type": msg_type,
+        })
+
+        image_urls = self._extract_image_urls(content)
+
+        if msg_type != "system" and image_urls:
+            # Download images in background and append exactly one rendered message.
+            def _fetch_embeds(message_content, urls):
+                sources = {}
+                for image_url in urls:
+                    uri = self._cache_image_url(image_url)
+                    if uri:
+                        sources[image_url] = uri
+                return self._build_message_body_html(message_content, sources)
+
+            def _apply(body_html):
+                if not body_html:
+                    body_html = self._build_message_body_html(content, {})
+                self.message_display.append(self.format_message_html(username, body_html, msg_type))
+
+            self._run_in_bg(_fetch_embeds, _apply, content, image_urls)
+            return
+
+        body_html = self._build_message_body_html(content, {})
+        self.message_display.append(self.format_message_html(username, body_html, msg_type))
 
     def open_message_link(self, url: QUrl):
         """Open links clicked inside the chat display in the default browser."""
@@ -921,10 +1275,19 @@ class ChatWindow(QMainWindow):
     def _update_room_list(self, rooms: list):
         """Update the room list widget (safe to call from any thread via signal)."""
         self.room_list.clear()
+        self._rooms_data.clear()
         for room in rooms:
-            item = QListWidgetItem(room["name"])
+            is_private = bool(room.get("is_private", False))
+            created_by = room.get("created_by")
+            prefix = "🔒 " if is_private else ""
+            item = QListWidgetItem(f"{prefix}{room['name']}")
             item.setData(Qt.ItemDataRole.UserRole, room["id"])
             self.room_list.addItem(item)
+            self._rooms_data[room["id"]] = {
+                "is_private": is_private,
+                "created_by": created_by,
+                "name": room["name"],
+            }
     
     def on_room_selected(self, item):
         """Handle room selection — all network calls run in background."""
@@ -934,6 +1297,7 @@ class ChatWindow(QMainWindow):
         self.current_room = room_id
         self.room_name_label.setText(f"Room: {room_name}")
         self.message_display.clear()
+        self._chat_raw_messages.clear()
         self.members_list.clear()
 
         # Stop previous WebSocket immediately (no blocking wait)
@@ -957,7 +1321,9 @@ class ChatWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "Failed to join room")
                 return
             self.message_display.clear()
-            for msg in result["messages"]:
+            self._chat_raw_messages.clear()
+            deduped_messages = self._dedupe_presence_history(result["messages"])
+            for msg in deduped_messages:
                 username = msg.get("username", "Unknown")
                 content = msg.get("content", "")
                 msg_type = msg.get("message_type", "text")
@@ -976,7 +1342,9 @@ class ChatWindow(QMainWindow):
             return msgs if ok else []
         def _apply(messages):
             self.message_display.clear()
-            for msg in messages:
+            self._chat_raw_messages.clear()
+            deduped_messages = self._dedupe_presence_history(messages)
+            for msg in deduped_messages:
                 username = msg.get("username", "Unknown")
                 content = msg.get("content", "")
                 msg_type = msg.get("message_type", "text")
@@ -993,12 +1361,14 @@ class ChatWindow(QMainWindow):
         if not content:
             return
 
-        if content.startswith("!commands"):
+        first_token = content.split(maxsplit=1)[0].lower()
+
+        if first_token == "!commands":
             self.show_room_commands()
             self.message_input.clear()
             return
 
-        if content.startswith("!clear"):
+        if first_token == "!clear":
             parts = content.split(maxsplit=1)
             if len(parts) < 2 or not parts[1].strip().isdigit():
                 self.append_system_message("Usage: !clear <count>")
@@ -1022,12 +1392,27 @@ class ChatWindow(QMainWindow):
             self.message_input.clear()
             return
 
+        if first_token == "!saveimages":
+            parts = content.split(maxsplit=1)
+            folder_arg = parts[1].strip() if len(parts) > 1 else None
+            success, result = self._save_images_from_chat(folder_arg)
+            if not success:
+                self.append_system_message(f"Save images: {result}")
+            else:
+                self.append_system_message(
+                    f"Saved {result['saved']} image(s)"
+                    f"{f' ({result['failed']} failed)' if result['failed'] else ''}"
+                    f" to {result['folder']}"
+                )
+            self.message_input.clear()
+            return
+
         if content.startswith("!botcommand") or content.startswith("!botcommands"):
             self.show_bot_commands()
             self.message_input.clear()
             return
 
-        if content.startswith("!room") or content.startswith("!createroom") or content.startswith("!removeroom") or content.startswith("!rooms") or content.startswith("!makeprivate"):
+        if content.startswith("!room") or content.startswith("!createroom") or content.startswith("!removeroom") or content.startswith("!rooms") or content.startswith("!makeprivate") or content.startswith("!invite"):
             self.handle_room_command(content)
             self.message_input.clear()
             return
@@ -1055,7 +1440,9 @@ class ChatWindow(QMainWindow):
             "!createroom <name> [private] - Create a new room",
             "!removeroom <name|id> - Delete a room (creator-only)",
             "!makeprivate - Make current room private (creator-only)",
+            "!invite <username> - Invite a user to current room (creator-only)",
             "!clear <count> - Clear recent non-system messages in this room",
+            "!saveimages [folder_path] - Save all image URLs currently visible in chat to a folder",
             "!room clear <count> - Alias for clearing recent room messages",
             "!botcommands - Show bot command list",
             "/room list - List available rooms",
@@ -1090,6 +1477,20 @@ class ChatWindow(QMainWindow):
         """Handle !bot and Discord-like ! commands typed in chat input."""
         cmd = raw_command.strip()
 
+        # Local-only utility command: never send to server/room.
+        if cmd.lower().startswith("!bot saveimages"):
+            parts = cmd.split(maxsplit=2)
+            folder_arg = parts[2].strip() if len(parts) > 2 else None
+            success, result = self._save_images_from_chat(folder_arg)
+            if not success:
+                self.append_system_message(f"Save images: {result}")
+            else:
+                failed_suffix = f" ({result['failed']} failed)" if result.get("failed") else ""
+                self.append_system_message(
+                    f"Saved {result['saved']} image(s){failed_suffix} to {result['folder']}"
+                )
+            return
+
         if cmd.startswith("!") and not cmd.lower().startswith("!bot"):
             bang_parts = cmd[1:].split(maxsplit=2)
             if not bang_parts:
@@ -1104,7 +1505,7 @@ class ChatWindow(QMainWindow):
             if bang_action == "help":
                 self.append_system_message(
                     "Discord-style commands: !start <seconds> [tags] | !pause | !resume | !stop | !status | !commands | "
-                    "!addtags <tag1,tag2> | !removetags <tag1,tag2> | !taglist | !cleartags"
+                    "!addtags <tag1,tag2> | !removetags <tag1,tag2> | !taglist | !cleartags | !saveimages [folder_path]"
                 )
                 return
 
@@ -1121,6 +1522,7 @@ class ChatWindow(QMainWindow):
                 "removetags": lambda: self.handle_bot_command(f"!bot tags remove {bang_rest}".strip()),
                 "taglist":    lambda: self.handle_bot_command("!bot tags list"),
                 "cleartags":  lambda: self.handle_bot_command("!bot tags clear"),
+                "saveimages": lambda: self.handle_bot_command(f"!bot saveimages {bang_rest}".strip()),
                 "search":     lambda: self.handle_bot_command(f"!bot search {bang_rest}".strip()),
                 "searchtags": lambda: self.handle_bot_command(f"!bot searchtags {bang_rest}".strip()),
                 "image":      lambda: self.handle_bot_command(f"!bot image {bang_rest}".strip()),
@@ -1134,7 +1536,7 @@ class ChatWindow(QMainWindow):
 
             self.append_system_message(
                 "Unknown command. Available: !start !stop !pause !resume !status "
-                "!search !searchtags !image !addtags !removetags !taglist !cleartags !blacklist !botcommands"
+                "!search !searchtags !image !addtags !removetags !taglist !cleartags !blacklist !saveimages !botcommands"
             )
             return
 
@@ -1430,6 +1832,21 @@ class ChatWindow(QMainWindow):
             self.refresh_rooms()
             return
 
+        if cmd.startswith("!invite"):
+            rest = cmd[len("!invite"):].strip()
+            if not rest:
+                self.append_system_message("Usage: !invite <username>")
+                return
+            if not self.current_room:
+                self.append_system_message("Join a room first, then run !invite <username>")
+                return
+            success, result = self.api_client.invite_user(self.current_room, rest)
+            if not success:
+                self.append_system_message(f"Invite failed: {result}")
+                return
+            self.append_system_message(result.get("message", f"Invited {rest}"))
+            return
+
         if cmd.startswith("!rooms"):
             success, rooms = self.api_client.list_rooms()
             if not success:
@@ -1629,16 +2046,24 @@ class ChatWindow(QMainWindow):
             self.notification_handler.notify_message_received(username, content[:50])
     
     def on_user_joined(self, data: dict):
-        """Handle user joined."""
+        """Handle user joined — suppress the notice for the user who joined."""
         username = data.get("username", "Unknown")
-        message = data.get("message", f"{username} joined")
-
+        # The user who triggered the join already knows they joined; only show to others.
+        if username == self.api_client.username:
+            self.refresh_members()
+            return
+        message = f"{username} is online"
         self.append_chat_message("SYSTEM", message, "system")
         self.notification_handler.notify_user_joined(username)
         self.refresh_members()
     
     def on_user_left(self, data: dict):
-        """Handle user left — update members list only; offline message comes from server."""
+        """Handle user left."""
+        username = data.get("username", "Unknown")
+        message = f"{username} is offline"
+
+        self.append_chat_message("SYSTEM", message, "system")
+        self.notification_handler.notify_user_left(username)
         self.refresh_members()
     
     def on_typing(self, data: dict):
@@ -1681,23 +2106,262 @@ class ChatWindow(QMainWindow):
         pass
     
     def show_settings(self):
-        """Show settings dialog."""
+        """Show settings dialog with Notifications and Appearance tabs."""
         dialog = QDialog(self)
         dialog.setWindowTitle("Settings")
-        layout = QVBoxLayout()
-        
-        # Sound toggle
-        layout.addWidget(QLabel("Notifications:"))
+        dialog.setMinimumWidth(520)
+        outer = QVBoxLayout()
+
+        tabs = QTabWidget()
+
+        # ── Tab 1: Notifications ──────────────────────────────────────────────
+        notif_widget = QWidget()
+        notif_layout = QVBoxLayout()
+        notif_layout.addWidget(QLabel("Notifications:"))
+
         sound_checkbox = QPushButton("Toggle Sound")
-        sound_checkbox.clicked.connect(
-            lambda: self.notification_handler.set_sound_enabled(
-                not self.notification_handler.sound_enabled
+        sound_checkbox.clicked.connect(self._toggle_notification_sound)
+        notif_layout.addWidget(sound_checkbox)
+
+        custom_sound_btn = QPushButton("Set Custom Message Sound")
+        custom_sound_btn.clicked.connect(self._pick_custom_sound)
+        notif_layout.addWidget(custom_sound_btn)
+
+        clear_custom_sound_btn = QPushButton("Clear Custom Sound")
+        clear_custom_sound_btn.clicked.connect(self._clear_custom_sound)
+        notif_layout.addWidget(clear_custom_sound_btn)
+
+        test_sound_btn = QPushButton("Test Notification Sound")
+        test_sound_btn.clicked.connect(self.notification_handler.play_sound)
+        notif_layout.addWidget(test_sound_btn)
+        notif_layout.addStretch()
+        notif_widget.setLayout(notif_layout)
+        tabs.addTab(notif_widget, "Notifications")
+
+        # ── Tab 2: Appearance ─────────────────────────────────────────────────
+        app_scroll = QScrollArea()
+        app_scroll.setWidgetResizable(True)
+        app_inner = QWidget()
+        app_layout = QVBoxLayout()
+        app_layout.setSpacing(6)
+
+        # Preset row
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Theme preset:"))
+        preset_combo = QComboBox()
+        preset_combo.addItems(["Custom", "Dark (Default)", "PowerShell", "Light", "Midnight Blue", "Forest Green"])
+        preset_row.addWidget(preset_combo)
+        apply_preset_btn = QPushButton("Apply Preset")
+        preset_row.addWidget(apply_preset_btn)
+        app_layout.addLayout(preset_row)
+
+        # Color pickers
+        color_settings = [
+            ("window_bg",      "Window background"),
+            ("panel_bg",       "Panel / widget background"),
+            ("border_color",   "Border / separator"),
+            ("text_color",     "Main text"),
+            ("button_bg",      "Button background"),
+            ("button_border",  "Button border"),
+            ("button_text",    "Button text"),
+            ("msg_own_name",   "Your username colour"),
+            ("msg_other_name", "Other username colour"),
+            ("msg_own_text",   "Your message text"),
+            ("msg_other_text", "Other message text"),
+            ("system_color",   "System message colour"),
+        ]
+
+        color_buttons: Dict[str, tuple] = {}
+
+        for key, label in color_settings:
+            row = QHBoxLayout()
+            lbl = QLabel(label + ":")
+            lbl.setMinimumWidth(200)
+            row.addWidget(lbl)
+
+            swatch = QPushButton()
+            swatch.setFixedSize(24, 24)
+            current_color = self._theme.get(key, "#ffffff")
+            swatch.setStyleSheet(
+                f"background-color:{current_color};"
+                f"border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
             )
-        )
-        layout.addWidget(sound_checkbox)
-        
-        dialog.setLayout(layout)
+            color_label = QLabel(current_color)
+            color_label.setMinimumWidth(76)
+
+            def _make_clicker(k, sw, cl):
+                def _click():
+                    from PyQt6.QtGui import QColor
+                    c = QColorDialog.getColor(QColor(self._theme.get(k, "#ffffff")), dialog, "Pick colour")
+                    if c.isValid():
+                        hex_val = c.name()
+                        self._theme[k] = hex_val
+                        sw.setStyleSheet(
+                            f"background-color:{hex_val};"
+                            f"border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
+                        )
+                        cl.setText(hex_val)
+                return _click
+
+            swatch.clicked.connect(_make_clicker(key, swatch, color_label))
+            row.addWidget(swatch)
+            row.addWidget(color_label)
+            row.addStretch()
+            app_layout.addLayout(row)
+            color_buttons[key] = (swatch, color_label)
+
+        # Font family
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("Font family:"))
+        font_combo = QComboBox()
+        font_combo.addItems(["(default)", "Consolas", "Courier New", "Segoe UI", "Arial",
+                             "Verdana", "Calibri", "Tahoma", "Lucida Console", "Cascadia Code"])
+        current_ff = self._theme.get("font_family", "")
+        font_combo.setCurrentText(current_ff if current_ff else "(default)")
+        font_row.addWidget(font_combo)
+        font_row.addStretch()
+        app_layout.addLayout(font_row)
+
+        # Font size
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Font size (px):"))
+        size_spin = QSpinBox()
+        size_spin.setRange(8, 28)
+        size_spin.setValue(int(self._theme.get("font_size", 13)))
+        size_row.addWidget(size_spin)
+        size_row.addStretch()
+        app_layout.addLayout(size_row)
+
+        # Apply / Reset buttons
+        btn_row = QHBoxLayout()
+        apply_theme_btn = QPushButton("Apply && Save")
+        reset_theme_btn = QPushButton("Reset to Default")
+        btn_row.addWidget(apply_theme_btn)
+        btn_row.addWidget(reset_theme_btn)
+        app_layout.addLayout(btn_row)
+        app_layout.addStretch()
+
+        app_inner.setLayout(app_layout)
+        app_scroll.setWidget(app_inner)
+        tabs.addTab(app_scroll, "Appearance")
+
+        # ── Wire preset selector ──────────────────────────────────────────────
+        def _apply_preset():
+            name = preset_combo.currentText()
+            if name == "Custom":
+                return
+            preset_data = _THEME_PRESETS.get(name, {})
+            for k, v in preset_data.items():
+                self._theme[k] = v
+            ff2 = self._theme.get("font_family", "")
+            font_combo.setCurrentText(ff2 if ff2 else "(default)")
+            size_spin.setValue(int(self._theme.get("font_size", 13)))
+            for k2, (sw2, cl2) in color_buttons.items():
+                cv = self._theme.get(k2, "#ffffff")
+                sw2.setStyleSheet(
+                    f"background-color:{cv};"
+                    f"border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
+                )
+                cl2.setText(cv)
+
+        apply_preset_btn.clicked.connect(_apply_preset)
+
+        # ── Wire apply & save ─────────────────────────────────────────────────
+        def _apply_and_save():
+            ff3 = font_combo.currentText()
+            self._theme["font_family"] = "" if ff3 == "(default)" else ff3
+            self._theme["font_size"] = size_spin.value()
+            self._apply_theme()
+            self._save_user_settings()
+            self.load_messages()
+
+        apply_theme_btn.clicked.connect(_apply_and_save)
+
+        # ── Wire reset ────────────────────────────────────────────────────────
+        def _reset_defaults():
+            self._theme = copy.deepcopy(_THEME_DEFAULTS)
+            font_combo.setCurrentText("(default)")
+            size_spin.setValue(13)
+            for k3, (sw3, cl3) in color_buttons.items():
+                cv2 = self._theme.get(k3, "#ffffff")
+                sw3.setStyleSheet(
+                    f"background-color:{cv2};"
+                    f"border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
+                )
+                cl3.setText(cv2)
+
+        reset_theme_btn.clicked.connect(_reset_defaults)
+
+        outer.addWidget(tabs)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        outer.addWidget(close_btn)
+        dialog.setLayout(outer)
         dialog.exec()
+
+    def _load_user_settings(self):
+        """Load persisted client-side settings."""
+        try:
+            if not self.settings_path.exists():
+                return
+            data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            sound_enabled = bool(data.get("sound_enabled", True))
+            custom_sound = data.get("custom_sound_path")
+            if custom_sound and not Path(custom_sound).exists():
+                custom_sound = None
+
+            self.notification_handler.set_sound_enabled(sound_enabled)
+            self.notification_handler.set_custom_sound(custom_sound)
+
+            saved_theme = data.get("theme")
+            if isinstance(saved_theme, dict):
+                for k, v in saved_theme.items():
+                    if k in _THEME_DEFAULTS:
+                        self._theme[k] = v
+        except Exception:
+            pass
+
+    def _save_user_settings(self):
+        """Persist client-side settings."""
+        try:
+            payload = {
+                "sound_enabled": self.notification_handler.sound_enabled,
+                "custom_sound_path": self.notification_handler.custom_sound_path,
+                "theme": self._theme,
+            }
+            self.settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _pick_custom_sound(self):
+        """Choose a custom sound file for incoming messages from other users."""
+        sound_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Notification Sound",
+            "",
+            "Audio Files (*.wav *.mp3);;All Files (*)",
+        )
+        if not sound_path:
+            return
+
+        self.notification_handler.set_custom_sound(sound_path)
+        self._save_user_settings()
+        self.append_system_message(f"Custom notification sound set: {sound_path}")
+
+    def _toggle_notification_sound(self):
+        """Toggle message notification sound for messages from other users."""
+        new_state = not self.notification_handler.sound_enabled
+        self.notification_handler.set_sound_enabled(new_state)
+        self._save_user_settings()
+        self.append_system_message(
+            f"Notification sound {'enabled' if new_state else 'disabled'}."
+        )
+
+    def _clear_custom_sound(self):
+        """Reset custom sound and fall back to default/system sound."""
+        self.notification_handler.set_custom_sound(None)
+        self._save_user_settings()
+        self.append_system_message("Custom notification sound cleared.")
     
     def logout(self):
         """Logout user."""

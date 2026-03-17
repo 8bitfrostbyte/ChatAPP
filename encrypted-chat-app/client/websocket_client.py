@@ -106,6 +106,14 @@ class WebSocketClient:
         elif msg_type == "message_deleted":
             if self.on_message_deleted_callback:
                 self.on_message_deleted_callback(data)
+
+        elif msg_type == "system_message":
+            if self.on_message_callback:
+                self.on_message_callback({
+                    "username": "SYSTEM",
+                    "content": data.get("message", ""),
+                    "message_type": "system",
+                })
     
     async def send_message(self, content: str):
         """Send a text message."""

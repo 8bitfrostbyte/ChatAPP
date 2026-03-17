@@ -13,19 +13,36 @@ from pathlib import Path
 class NotificationHandler:
     """Handles desktop notifications and sound alerts."""
     
-    def __init__(self, parent: Optional[QMainWindow] = None, sound_enabled: bool = True):
+    def __init__(
+        self,
+        parent: Optional[QMainWindow] = None,
+        sound_enabled: bool = True,
+        custom_sound_path: Optional[str] = None,
+    ):
         self.parent = parent
         self.sound_enabled = sound_enabled
         self.notification_sound = None
+        self.custom_sound_path = custom_sound_path
         self.setup_sounds()
     
     def setup_sounds(self):
         """Setup notification sounds."""
+        self.notification_sound = None
+
+        if self.custom_sound_path and os.path.exists(self.custom_sound_path):
+            self.notification_sound = self.custom_sound_path
+            return
+
         # Try to find a notification sound file
         # If not found, we'll create a simple beep using the system
         sound_path = Path(__file__).parent / "sounds" / "notification.mp3"
         if sound_path.exists():
             self.notification_sound = str(sound_path)
+
+    def set_custom_sound(self, sound_path: Optional[str]):
+        """Set a custom notification sound file path."""
+        self.custom_sound_path = sound_path
+        self.setup_sounds()
     
     def show_notification(self, title: str, message: str, duration: int = 3000):
         """Show a system notification."""

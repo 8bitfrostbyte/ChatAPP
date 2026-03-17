@@ -383,6 +383,7 @@ async def list_rooms(authorization: str = Header(None), db: Session = Depends(ge
             "id": r.id,
             "name": r.name,
             "is_private": r.is_private,
+            "created_by": r.created_by,
             "created_at": r.created_at
         }
         for r in rooms
@@ -641,6 +642,61 @@ async def leave_room(
     })
     
     return {"message": "Left room successfully"}
+
+
+@app.post("/api/rooms/{room_id}/invite")
+async def invite_user_to_room(
+    room_id: int,
+    username: str,
+    authorization: str = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Invite a user to a room. Only the room creator can do this."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    token = authorization.split(" ")[1]
+    user, error = auth_manager.verify_token(db, token)
+    if error:
+        raise HTTPException(status_code=401, detail=error)
+
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    if room.created_by != user.id:
+        raise HTTPException(status_code=403, detail="Only the room creator can invite users")
+
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+
+    existing = db.query(RoomMember).filter(
+        RoomMember.room_id == room_id,
+        RoomMember.user_id == target.id
+    ).first()
+    if existing:
+        return {"message": f"{username} is already a member of this room"}
+
+    db.add(RoomMember(room_id=room_id, user_id=target.id))
+    db.commit()
+
+    system_msg_text = f"{username} was invited to the room by {user.username}"
+    system_msg = Message(
+        room_id=room_id,
+        user_id=user.id,
+        content=encryption_manager.encrypt_message(room_id, system_msg_text),
+        message_type="system"
+    )
+    db.add(system_msg)
+    db.commit()
+
+    await manager.broadcast(room_id, {
+        "type": "system_message",
+        "message": system_msg_text,
+    })
+
+    return {"message": f"Invited {username} to the room"}
 
 
 @app.get("/api/rooms/{room_id}/members", response_model=List[Dict])
@@ -914,7 +970,7 @@ async def search_tags(query: str):
     if not query or len(query.strip()) < 2:
         raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
     
-    results = image_bot.search_tags(query, limit=50)
+    results = image_bot.search_tags(query, limit=150)
     return results
 
 

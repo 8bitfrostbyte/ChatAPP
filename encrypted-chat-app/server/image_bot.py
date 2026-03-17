@@ -232,19 +232,25 @@ class ImageBot:
         return sorted(self.config.start_tags)
 
     def resolve_start_tag_pool(self, start_tags_input: Optional[str]) -> Dict:
-        """Resolve start behavior like the original bot."""
+        """Resolve start behavior like the original bot.
+        
+        Only explicitly provided tags are saved to saved_tags.
+        Random/fallback tags are NOT saved.
+        """
         if start_tags_input and start_tags_input.strip():
             parsed = self.parse_tag_list(start_tags_input)
             if parsed:
+                # ONLY save explicitly provided tags, don't save random fallback tags
                 self.config.saved_tags.update(parsed)
                 self.config.start_tags.update(parsed)
                 self.save_saved_tags()
                 return {"mode": "explicit", "tag_pool": parsed, "saved": True}
 
         if self.config.start_tags:
+            # Using saved tags - these were already saved before, don't save again
             return {"mode": "saved", "tag_pool": sorted(self.config.start_tags), "saved": False}
 
-        # Keep empty tag_pool for true random mode; fetch layer applies robust fallbacks.
+        # Random mode: empty tag_pool, uses fallback tags internally but DOES NOT save them
         return {"mode": "random", "tag_pool": [], "saved": False}
 
     def _effective_tag_pool(self, tag_pool: List[str]) -> List[str]:
