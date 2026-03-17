@@ -110,31 +110,18 @@ class BotStreamManager:
             db.close()
 
     async def _post_bot_message(self, room_id: int, content: str):
-        db = SessionLocal()
-        try:
-            bot_user_id = self._get_or_create_bot_user_id()
-            encrypted_content = encryption_manager.encrypt_message(room_id, content)
-            message = Message(
-                room_id=room_id,
-                user_id=bot_user_id,
-                content=encrypted_content,
-                message_type="bot"
-            )
-            db.add(message)
-            db.commit()
-            db.refresh(message)
-
-            await manager.broadcast(room_id, {
-                "type": "message_new",
-                "id": message.id,
-                "user_id": bot_user_id,
-                "username": "ImageBot",
-                "content": content,
-                "message_type": "bot",
-                "created_at": message.created_at.isoformat()
-            })
-        finally:
-            db.close()
+        # Bot messages are ephemeral: broadcast only to current WS subscribers,
+        # never saved to the database.  This ensures they only appear in the room
+        # where the stream is active and never pollute other rooms' history.
+        await manager.broadcast(room_id, {
+            "type": "message_new",
+            "id": -1,
+            "user_id": -1,
+            "username": "ImageBot",
+            "content": content,
+            "message_type": "bot",
+            "created_at": datetime.utcnow().isoformat()
+        })
 
     async def _run_stream(self, room_id: int, interval: float, tag_pool: List[str], mode: str):
         try:

@@ -3,6 +3,7 @@ WebSocket client for real-time messaging.
 """
 
 import asyncio
+import contextlib
 import websockets
 import json
 from typing import Callable, Optional
@@ -143,6 +144,10 @@ class WebSocketClient:
         if self.websocket:
             if self.receive_task:
                 self.receive_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.receive_task
             await self.websocket.close()
+            self.receive_task = None
+            self.websocket = None
             self.is_connected = False
             print(f"Disconnected from room {self.room_id}")

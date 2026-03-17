@@ -550,28 +550,42 @@ class WebSocketThread(QThread):
         self.room_id = room_id
         self.client = None
         self.loop = None
+
+    async def _run_client(self):
+        self.client = WebSocketClient(self.server_url, self.token, self.room_id)
+        self.client.set_on_message(lambda data: self.message_received.emit(data))
+        self.client.set_on_user_joined(lambda data: self.user_joined.emit(data))
+        self.client.set_on_user_left(lambda data: self.user_left.emit(data))
+        self.client.set_on_typing(lambda data: self.typing_received.emit(data))
+        self.client.set_on_message_deleted(lambda data: self.message_deleted.emit(data))
+
+        await self.client.connect()
+        if self.client.receive_task:
+            try:
+                await self.client.receive_task
+            except asyncio.CancelledError:
+                pass
     
     def run(self):
         """Run the WebSocket connection."""
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
-            
-            self.client = WebSocketClient(self.server_url, self.token, self.room_id)
-            self.client.set_on_message(lambda data: self.message_received.emit(data))
-            self.client.set_on_user_joined(lambda data: self.user_joined.emit(data))
-            self.client.set_on_user_left(lambda data: self.user_left.emit(data))
-            self.client.set_on_typing(lambda data: self.typing_received.emit(data))
-            self.client.set_on_message_deleted(lambda data: self.message_deleted.emit(data))
-            
-            self.loop.run_until_complete(self.client.connect())
-            self.loop.run_forever()
+            self.loop.run_until_complete(self._run_client())
         
         except Exception as e:
             print(f"WebSocket thread error: {e}")
         
         finally:
             if self.loop:
+                pending = asyncio.all_tasks(self.loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    try:
+                        self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    except Exception:
+                        pass
                 self.loop.close()
             self.connection_closed.emit()
     
@@ -586,10 +600,14 @@ class WebSocketThread(QThread):
     def stop(self):
         """Stop the WebSocket connection."""
         if self.client and self.loop:
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 self.client.disconnect(),
                 self.loop
             )
+            try:
+                future.result(timeout=2)
+            except Exception:
+                pass
 
 
 class WorkerThread(QThread):
@@ -717,7 +735,10 @@ class ChatWindow(QMainWindow):
         self._chat_raw_messages = []
         self._last_presence_message = None
         self._last_presence_at = 0.0
+        self._seen_live_message_keys = set()
+        self._room_list_snapshot = []
         self._rooms_data: Dict[int, dict] = {}  # room_id -> {is_private, created_by}
+        self._room_select_epoch = 0
         self.settings_path = Path(__file__).parent / "user_settings.json"
         self._theme: Dict = copy.deepcopy(_THEME_DEFAULTS)
         self._load_user_settings()
@@ -1272,10 +1293,37 @@ class ChatWindow(QMainWindow):
                 self._update_room_list(result[1])
         self._run_in_bg(self.api_client.list_rooms, _apply)
 
+    def _message_event_key(self, data: dict):
+        """Build a stable key for deduplicating repeated live events."""
+        message_id = data.get("id")
+        if message_id not in (None, -1):
+            return ("id", int(message_id))
+        return (
+            data.get("message_type", "text"),
+            data.get("username", "Unknown"),
+            data.get("content", ""),
+            data.get("created_at", ""),
+        )
+
     def _update_room_list(self, rooms: list):
         """Update the room list widget (safe to call from any thread via signal)."""
+        snapshot = [
+            (
+                room.get("id"),
+                room.get("name"),
+                bool(room.get("is_private", False)),
+                room.get("created_by"),
+            )
+            for room in rooms
+        ]
+        if snapshot == self._room_list_snapshot:
+            return
+
+        self._room_list_snapshot = snapshot
+        selected_room_id = self.current_room
         self.room_list.clear()
         self._rooms_data.clear()
+        selected_item = None
         for room in rooms:
             is_private = bool(room.get("is_private", False))
             created_by = room.get("created_by")
@@ -1283,11 +1331,15 @@ class ChatWindow(QMainWindow):
             item = QListWidgetItem(f"{prefix}{room['name']}")
             item.setData(Qt.ItemDataRole.UserRole, room["id"])
             self.room_list.addItem(item)
+            if room["id"] == selected_room_id:
+                selected_item = item
             self._rooms_data[room["id"]] = {
                 "is_private": is_private,
                 "created_by": created_by,
                 "name": room["name"],
             }
+        if selected_item is not None:
+            self.room_list.setCurrentItem(selected_item)
     
     def on_room_selected(self, item):
         """Handle room selection — all network calls run in background."""
@@ -1295,14 +1347,18 @@ class ChatWindow(QMainWindow):
         room_name = item.text()
 
         self.current_room = room_id
+        self._room_select_epoch += 1
+        epoch = self._room_select_epoch
         self.room_name_label.setText(f"Room: {room_name}")
         self.message_display.clear()
         self._chat_raw_messages.clear()
+        self._seen_live_message_keys.clear()
         self.members_list.clear()
 
         # Stop previous WebSocket immediately (no blocking wait)
         if self.websocket_thread:
             self.websocket_thread.stop()
+            self.websocket_thread.wait(1500)
             self.websocket_thread = None
 
         def _fetch(rid):
@@ -1317,13 +1373,17 @@ class ChatWindow(QMainWindow):
             }
 
         def _apply(result):
+            if self._room_select_epoch != epoch:
+                return  # stale callback — a newer room was selected, discard
             if result is None:
                 QMessageBox.warning(self, "Error", "Failed to join room")
                 return
             self.message_display.clear()
             self._chat_raw_messages.clear()
+            self._seen_live_message_keys.clear()
             deduped_messages = self._dedupe_presence_history(result["messages"])
             for msg in deduped_messages:
+                self._seen_live_message_keys.add(self._message_event_key(msg))
                 username = msg.get("username", "Unknown")
                 content = msg.get("content", "")
                 msg_type = msg.get("message_type", "text")
@@ -1343,8 +1403,10 @@ class ChatWindow(QMainWindow):
         def _apply(messages):
             self.message_display.clear()
             self._chat_raw_messages.clear()
+            self._seen_live_message_keys.clear()
             deduped_messages = self._dedupe_presence_history(messages)
             for msg in deduped_messages:
+                self._seen_live_message_keys.add(self._message_event_key(msg))
                 username = msg.get("username", "Unknown")
                 content = msg.get("content", "")
                 msg_type = msg.get("message_type", "text")
@@ -1557,6 +1619,16 @@ class ChatWindow(QMainWindow):
         action = parts[1].lower()
         arg = parts[2].strip() if len(parts) > 2 else ""
 
+        def _run_bot_request(api_fn, on_success, error_prefix: str, *api_args):
+            def _apply(result):
+                success, payload = result if result else (False, "Request failed")
+                if not success:
+                    self.append_system_message(f"{error_prefix}: {payload}")
+                    return
+                on_success(payload)
+
+            self._run_in_bg(api_fn, _apply, *api_args)
+
         if action == "start":
             if not self.current_room:
                 self.append_system_message("Join a room first before starting bot stream.")
@@ -1575,15 +1647,21 @@ class ChatWindow(QMainWindow):
                 return
 
             tags = start_parts[1].strip() if len(start_parts) > 1 else None
-            success, result = self.api_client.start_bot_stream(self.current_room, interval, tags)
-            if not success:
-                self.append_system_message(f"Failed to start stream: {result}")
-                return
 
-            mode = result.get("mode", "?")
-            pool = result.get("tag_pool", [])
-            self.append_system_message(
-                f"Bot stream started: every {interval:g}s | mode: {mode} | tags: {', '.join(pool) if pool else 'rating:explicit'}"
+            def _start_success(result):
+                mode = result.get("mode", "?")
+                pool = result.get("tag_pool", [])
+                self.append_system_message(
+                    f"Bot stream started: every {interval:g}s | mode: {mode} | tags: {', '.join(pool) if pool else 'rating:explicit'}"
+                )
+
+            _run_bot_request(
+                self.api_client.start_bot_stream,
+                _start_success,
+                "Failed to start stream",
+                self.current_room,
+                interval,
+                tags,
             )
             return
 
@@ -1591,58 +1669,65 @@ class ChatWindow(QMainWindow):
             if not self.current_room:
                 self.append_system_message("Join a room first before stopping bot stream.")
                 return
-            success, result = self.api_client.stop_bot_stream(self.current_room)
-            if not success:
-                self.append_system_message(f"Failed to stop stream: {result}")
-                return
-            self.append_system_message("Bot stream stopped.")
+            _run_bot_request(
+                self.api_client.stop_bot_stream,
+                lambda _result: self.append_system_message("Bot stream stopped."),
+                "Failed to stop stream",
+                self.current_room,
+            )
             return
 
         if action == "pause":
             if not self.current_room:
                 self.append_system_message("Join a room first before pausing bot stream.")
                 return
-            success, result = self.api_client.pause_bot_stream(self.current_room)
-            if not success:
-                self.append_system_message(f"Failed to pause stream: {result}")
-                return
-            self.append_system_message("Bot stream paused.")
+            _run_bot_request(
+                self.api_client.pause_bot_stream,
+                lambda _result: self.append_system_message("Bot stream paused."),
+                "Failed to pause stream",
+                self.current_room,
+            )
             return
 
         if action == "resume":
             if not self.current_room:
                 self.append_system_message("Join a room first before resuming bot stream.")
                 return
-            success, result = self.api_client.resume_bot_stream(self.current_room)
-            if not success:
-                self.append_system_message(f"Failed to resume stream: {result}")
-                return
-            self.append_system_message("Bot stream resumed.")
+            _run_bot_request(
+                self.api_client.resume_bot_stream,
+                lambda _result: self.append_system_message("Bot stream resumed."),
+                "Failed to resume stream",
+                self.current_room,
+            )
             return
 
         if action == "status":
             if not self.current_room:
                 self.append_system_message("Join a room first before checking bot stream status.")
                 return
-            success, result = self.api_client.bot_stream_status(self.current_room)
-            if not success:
-                self.append_system_message(f"Failed to get stream status: {result}")
-                return
 
-            if result.get("running"):
-                cfg = result.get("config") or {}
-                self.append_system_message(
-                    f"Bot stream running: every {cfg.get('interval', '?')}s | mode: {cfg.get('mode', '?')} | "
-                    f"tags: {', '.join(cfg.get('tag_pool', [])) if cfg.get('tag_pool') else 'rating:explicit'}"
-                )
-            elif result.get("paused"):
-                cfg = result.get("config") or {}
-                self.append_system_message(
-                    f"Bot stream paused: every {cfg.get('interval', '?')}s | mode: {cfg.get('mode', '?')} | "
-                    f"tags: {', '.join(cfg.get('tag_pool', [])) if cfg.get('tag_pool') else 'rating:explicit'}"
-                )
-            else:
-                self.append_system_message("Bot stream is not running in this room.")
+            def _status_success(result):
+                if result.get("running"):
+                    cfg = result.get("config") or {}
+                    self.append_system_message(
+                        f"Bot stream running: every {cfg.get('interval', '?')}s | mode: {cfg.get('mode', '?')} | "
+                        f"tags: {', '.join(cfg.get('tag_pool', [])) if cfg.get('tag_pool') else 'rating:explicit'}"
+                    )
+                elif result.get("paused"):
+                    cfg = result.get("config") or {}
+                    self.append_system_message(
+                        f"Bot stream paused: every {cfg.get('interval', '?')}s | mode: {cfg.get('mode', '?')} | "
+                        f"tags: {', '.join(cfg.get('tag_pool', [])) if cfg.get('tag_pool') else 'rating:explicit'}"
+                    )
+                else:
+                    self.append_system_message("Bot stream is not running in this room.")
+
+            _run_bot_request(
+                self.api_client.bot_stream_status,
+                _status_success,
+                "Failed to get stream status",
+                self.current_room,
+            )
             return
 
         if action == "tags":
@@ -1651,42 +1736,49 @@ class ChatWindow(QMainWindow):
             tags_arg = tags_parts[1].strip() if len(tags_parts) > 1 else ""
 
             if tags_action == "list":
-                success, result = self.api_client.get_saved_tags()
-                if not success:
-                    self.append_system_message(f"Failed to fetch saved tags: {result}")
-                    return
-                saved = result.get("saved_tags", [])
-                self.append_system_message(
-                    f"Saved tags ({len(saved)}): {', '.join(saved) if saved else 'empty'}"
+                def _list_tags_success(result):
+                    saved = result.get("saved_tags", [])
+                    self.append_system_message(
+                        f"Saved tags ({len(saved)}): {', '.join(saved) if saved else 'empty'}"
+                    )
+
+                _run_bot_request(
+                    self.api_client.get_saved_tags,
+                    _list_tags_success,
+                    "Failed to fetch saved tags",
                 )
                 return
 
             if tags_action == "add" and tags_arg:
-                success, result = self.api_client.add_saved_tags(tags_arg)
-                if not success:
-                    self.append_system_message(f"Failed to add tags: {result}")
-                    return
-                self.append_system_message(
-                    f"Added tags: {result.get('added', 0)} | Saved total: {len(result.get('saved_tags', []))}"
+                _run_bot_request(
+                    self.api_client.add_saved_tags,
+                    lambda result: self.append_system_message(
+                        f"Added tags: {result.get('added', 0)} | Saved total: {len(result.get('saved_tags', []))}"
+                    ),
+                    "Failed to add tags",
+                    tags_arg,
                 )
                 return
 
             if tags_action == "remove" and tags_arg:
-                success, result = self.api_client.remove_saved_tags(tags_arg)
-                if not success:
-                    self.append_system_message(f"Failed to remove tags: {result}")
-                    return
-                self.append_system_message(
-                    f"Removed tags: {result.get('removed', 0)} | Saved total: {len(result.get('saved_tags', []))}"
+                _run_bot_request(
+                    self.api_client.remove_saved_tags,
+                    lambda result: self.append_system_message(
+                        f"Removed tags: {result.get('removed', 0)} | Saved total: {len(result.get('saved_tags', []))}"
+                    ),
+                    "Failed to remove tags",
+                    tags_arg,
                 )
                 return
 
             if tags_action == "clear":
-                success, result = self.api_client.clear_saved_tags()
-                if not success:
-                    self.append_system_message(f"Failed to clear tags: {result}")
-                    return
-                self.append_system_message(f"Cleared saved tags. Removed: {result.get('removed', 0)}")
+                _run_bot_request(
+                    self.api_client.clear_saved_tags,
+                    lambda result: self.append_system_message(
+                        f"Cleared saved tags. Removed: {result.get('removed', 0)}"
+                    ),
+                    "Failed to clear tags",
+                )
                 return
 
             self.append_system_message("Usage: !bot tags list|add <tags>|remove <tags>|clear")
@@ -1697,80 +1789,76 @@ class ChatWindow(QMainWindow):
             return
 
         if action in {"search", "searchtags"}:
-            success, result = self.api_client.search_tags(arg)
-            if not success:
-                self.append_system_message(f"Bot search failed: {result}")
-                return
 
-            combined = result.get("combined", [])
-            if not combined:
-                self.append_system_message(f"No tags found for '{result.get('query', arg)}'.")
-                return
+            def _search_success(result):
+                combined = result.get("combined", [])
+                if not combined:
+                    self.append_system_message(f"No tags found for '{result.get('query', arg)}'.")
+                    return
 
-            query_tag = result.get("query", arg.strip().lower().replace(" ", "_"))
+                query_tag = result.get("query", arg.strip().lower().replace(" ", "_"))
 
-            # Always present exact input tag first when present, then sort remaining by total images.
-            combined_sorted = sorted(
-                combined,
-                key=lambda item: (-int(item.get("count", 0) or 0), str(item.get("name", "")))
-            )
-            exact_match = next((item for item in combined_sorted if item.get("name") == query_tag), None)
-            remaining = [item for item in combined_sorted if item.get("name") != query_tag]
-            exact_count = int(exact_match.get("count", 0) or 0) if exact_match else 0
-            exact_entry = {
-                "name": query_tag,
-                "count": exact_count,
-                "rule34_count": int((result.get("rule34") or {}).get(query_tag, 0) or 0),
-                "danbooru_count": int((result.get("danbooru") or {}).get(query_tag, 0) or 0),
-            }
-            ordered = [exact_entry] + remaining
-            total_combined = sum(int(item.get("count", 0) or 0) for item in combined_sorted)
+                combined_sorted = sorted(
+                    combined,
+                    key=lambda item: (-int(item.get("count", 0) or 0), str(item.get("name", "")))
+                )
+                exact_match = next((item for item in combined_sorted if item.get("name") == query_tag), None)
+                remaining = [item for item in combined_sorted if item.get("name") != query_tag]
+                exact_count = int(exact_match.get("count", 0) or 0) if exact_match else 0
+                exact_entry = {
+                    "name": query_tag,
+                    "count": exact_count,
+                    "rule34_count": int((result.get("rule34") or {}).get(query_tag, 0) or 0),
+                    "danbooru_count": int((result.get("danbooru") or {}).get(query_tag, 0) or 0),
+                }
+                ordered = [exact_entry] + remaining
+                total_combined = sum(int(item.get("count", 0) or 0) for item in combined_sorted)
 
-            self.append_system_message(
-                f"Tag Search: {query_tag} | Combined Image Count (R34+Danbooru): {total_combined} | "
-                f"Exact Tag Images: {exact_count} | Rule34: {len(result.get('rule34', {}))} | "
-                f"Danbooru: {len(result.get('danbooru', {}))} | Listed Tags: {len(combined_sorted)}"
-            )
+                self.append_system_message(
+                    f"Tag Search: {query_tag} | Combined Image Count (R34+Danbooru): {total_combined} | "
+                    f"Exact Tag Images: {exact_count} | Rule34: {len(result.get('rule34', {}))} | "
+                    f"Danbooru: {len(result.get('danbooru', {}))} | Listed Tags: {len(combined_sorted)}"
+                )
 
-            # Compact list format: trap(11061), trap_on_trap(8009), ...
-            entries = [f"{item.get('name')}({int(item.get('count', 0) or 0)})" for item in ordered]
-            chunk = ""
-            for entry in entries:
-                candidate = f"{chunk}, {entry}" if chunk else entry
-                if len(candidate) > 1400:
+                entries = [f"{item.get('name')}({int(item.get('count', 0) or 0)})" for item in ordered]
+                chunk = ""
+                for entry in entries:
+                    candidate = f"{chunk}, {entry}" if chunk else entry
+                    if len(candidate) > 1400:
+                        self.append_system_message(chunk)
+                        chunk = entry
+                    else:
+                        chunk = candidate
+                if chunk:
                     self.append_system_message(chunk)
-                    chunk = entry
-                else:
-                    chunk = candidate
-            if chunk:
-                self.append_system_message(chunk)
+
+            _run_bot_request(self.api_client.search_tags, _search_success, "Bot search failed", arg)
             return
 
         if action == "image":
-            success, result = self.api_client.fetch_bot_images(arg, limit=1)
-            if not success:
-                self.append_system_message(f"Bot image fetch failed: {result}")
-                return
 
-            images = result.get("images", [])
-            if not images:
-                self.append_system_message(f"No images found for tags '{arg}'.")
-                return
+            def _image_success(result):
+                images = result.get("images", [])
+                if not images:
+                    self.append_system_message(f"No images found for tags '{arg}'.")
+                    return
 
-            image_url = images[0].get("url")
-            image_tags = images[0].get("tags", "")
-            if not image_url:
-                self.append_system_message("Bot returned an image without URL.")
-                return
+                image_url = images[0].get("url")
+                image_tags = images[0].get("tags", "")
+                if not image_url:
+                    self.append_system_message("Bot returned an image without URL.")
+                    return
 
-            pretty_tags = image_tags if image_tags else "(no tags)"
-            payload = f"Tags: {pretty_tags}\n{image_url}"
+                pretty_tags = image_tags if image_tags else "(no tags)"
+                payload = f"Tags: {pretty_tags}\n{image_url}"
 
-            if self.websocket_thread and self.websocket_thread.client:
-                self.websocket_thread.send_message(payload)
-                self.append_system_message("Bot image sent to room.")
-            else:
-                self.append_system_message(payload)
+                if self.websocket_thread and self.websocket_thread.client:
+                    self.websocket_thread.send_message(payload)
+                    self.append_system_message("Bot image sent to room.")
+                else:
+                    self.append_system_message(payload)
+
+            _run_bot_request(self.api_client.fetch_bot_images, _image_success, "Bot image fetch failed", arg, 1)
             return
 
         if action == "blacklist":
@@ -1779,33 +1867,34 @@ class ChatWindow(QMainWindow):
             bl_tags = bl_parts[1].strip() if len(bl_parts) > 1 else ""
 
             if bl_action == "show":
-                success, result = self.api_client.get_bot_blacklist()
-                if not success:
-                    self.append_system_message(f"Failed to fetch blacklist: {result}")
-                    return
-                tags = result.get("blacklist", [])
-                self.append_system_message(
-                    f"Bot blacklist ({len(tags)}): {', '.join(tags) if tags else 'empty'}"
+                _run_bot_request(
+                    self.api_client.get_bot_blacklist,
+                    lambda result: self.append_system_message(
+                        f"Bot blacklist ({len(result.get('blacklist', []))}): {', '.join(result.get('blacklist', [])) if result.get('blacklist', []) else 'empty'}"
+                    ),
+                    "Failed to fetch blacklist",
                 )
                 return
 
             if bl_action == "add" and bl_tags:
-                success, result = self.api_client.add_bot_blacklist(bl_tags)
-                if not success:
-                    self.append_system_message(f"Failed to add blacklist tags: {result}")
-                    return
-                self.append_system_message(
-                    f"Added blacklist tags. Total: {len(result.get('blacklist', []))}"
+                _run_bot_request(
+                    self.api_client.add_bot_blacklist,
+                    lambda result: self.append_system_message(
+                        f"Added blacklist tags. Total: {len(result.get('blacklist', []))}"
+                    ),
+                    "Failed to add blacklist tags",
+                    bl_tags,
                 )
                 return
 
             if bl_action == "remove" and bl_tags:
-                success, result = self.api_client.remove_bot_blacklist(bl_tags)
-                if not success:
-                    self.append_system_message(f"Failed to remove blacklist tags: {result}")
-                    return
-                self.append_system_message(
-                    f"Removed blacklist tags. Total: {len(result.get('blacklist', []))}"
+                _run_bot_request(
+                    self.api_client.remove_bot_blacklist,
+                    lambda result: self.append_system_message(
+                        f"Removed blacklist tags. Total: {len(result.get('blacklist', []))}"
+                    ),
+                    "Failed to remove blacklist tags",
+                    bl_tags,
                 )
                 return
 
@@ -1823,13 +1912,18 @@ class ChatWindow(QMainWindow):
                 self.append_system_message("Join a room first, then run !makeprivate")
                 return
 
-            success, result = self.api_client.make_room_private(self.current_room)
-            if not success:
-                self.append_system_message(f"Make private failed: {result}")
-                return
+            room_id = self.current_room
 
-            self.append_system_message(result.get("message", "Room is now private"))
-            self.refresh_rooms()
+            def _apply_make_private(result):
+                success, payload = result if result else (False, "Request failed")
+                if not success:
+                    self.append_system_message(f"Make private failed: {payload}")
+                    return
+
+                self.append_system_message(payload.get("message", "Room is now private"))
+                self.refresh_rooms()
+
+            self._run_in_bg(self.api_client.make_room_private, _apply_make_private, room_id)
             return
 
         if cmd.startswith("!invite"):
@@ -1840,29 +1934,39 @@ class ChatWindow(QMainWindow):
             if not self.current_room:
                 self.append_system_message("Join a room first, then run !invite <username>")
                 return
-            success, result = self.api_client.invite_user(self.current_room, rest)
-            if not success:
-                self.append_system_message(f"Invite failed: {result}")
-                return
-            self.append_system_message(result.get("message", f"Invited {rest}"))
+
+            room_id = self.current_room
+            username = rest
+
+            def _apply_invite(result):
+                success, payload = result if result else (False, "Request failed")
+                if not success:
+                    self.append_system_message(f"Invite failed: {payload}")
+                    return
+                self.append_system_message(payload.get("message", f"Invited {username}"))
+
+            self._run_in_bg(self.api_client.invite_user, _apply_invite, room_id, username)
             return
 
         if cmd.startswith("!rooms"):
-            success, rooms = self.api_client.list_rooms()
-            if not success:
-                self.append_system_message("Failed to fetch room list.")
-                return
+            def _apply_rooms(result):
+                success, rooms = result if result else (False, [])
+                if not success:
+                    self.append_system_message("Failed to fetch room list.")
+                    return
 
-            if not rooms:
-                self.append_system_message("No rooms available.")
-                return
+                if not rooms:
+                    self.append_system_message("No rooms available.")
+                    return
 
-            lines = []
-            for room in rooms:
-                visibility = "private" if room.get("is_private") else "public"
-                lines.append(f"{room.get('id')}: {room.get('name')} ({visibility})")
+                lines = []
+                for room in rooms:
+                    visibility = "private" if room.get("is_private") else "public"
+                    lines.append(f"{room.get('id')}: {room.get('name')} ({visibility})")
 
-            self.append_system_message("Rooms: " + " | ".join(lines))
+                self.append_system_message("Rooms: " + " | ".join(lines))
+
+            self._run_in_bg(self.api_client.list_rooms, _apply_rooms)
             return
 
         if cmd.startswith("!createroom"):
@@ -1880,16 +1984,21 @@ class ChatWindow(QMainWindow):
                 self.append_system_message("Usage: !createroom <room name> [private]")
                 return
 
-            success, result = self.api_client.create_room(rest, is_private=is_private)
-            if not success:
-                self.append_system_message(f"Create room failed: {result}")
-                return
+            room_name = rest
 
-            self.append_system_message(
-                f"Room created: {result.get('name', rest)}"
-                f" ({'private' if is_private else 'public'})"
-            )
-            self.refresh_rooms()
+            def _apply_create_room(result):
+                success, payload = result if result else (False, "Request failed")
+                if not success:
+                    self.append_system_message(f"Create room failed: {payload}")
+                    return
+
+                self.append_system_message(
+                    f"Room created: {payload.get('name', room_name)}"
+                    f" ({'private' if is_private else 'public'})"
+                )
+                self.refresh_rooms()
+
+            self._run_in_bg(self.api_client.create_room, _apply_create_room, room_name, is_private)
             return
 
         if cmd.startswith("!removeroom"):
@@ -1899,38 +2008,51 @@ class ChatWindow(QMainWindow):
                 return
 
             target_room_id = None
-            if rest.isdigit():
-                target_room_id = int(rest)
-            else:
-                ok, rooms = self.api_client.list_rooms()
-                if ok:
-                    for room in rooms:
-                        if room.get("name", "").strip().lower() == rest.lower():
-                            target_room_id = room.get("id")
-                            break
 
-            if not target_room_id:
-                self.append_system_message(f"Room not found: {rest}")
-                return
+            def _fetch_delete_room(target):
+                target_room_id = None
+                if target.isdigit():
+                    target_room_id = int(target)
+                else:
+                    ok, rooms = self.api_client.list_rooms()
+                    if ok:
+                        for room in rooms:
+                            if room.get("name", "").strip().lower() == target.lower():
+                                target_room_id = room.get("id")
+                                break
 
-            success, result = self.api_client.delete_room(target_room_id)
-            if not success:
-                self.append_system_message(f"Remove room failed: {result}")
-                return
+                if not target_room_id:
+                    return False, {"error": f"Room not found: {target}"}
 
-            self.append_system_message(f"Room removed (id={target_room_id}).")
+                success, payload = self.api_client.delete_room(target_room_id)
+                return success, {
+                    "room_id": target_room_id,
+                    "payload": payload,
+                }
 
-            if self.current_room == target_room_id:
-                self.current_room = None
-                self.room_name_label.setText("Select a room")
-                self.message_display.clear()
-                self.members_list.clear()
-                if self.websocket_thread:
-                    self.websocket_thread.stop()
-                    self.websocket_thread.wait()
-                    self.websocket_thread = None
+            def _apply_delete_room(result):
+                success, payload = result if result else (False, {"error": "Request failed"})
+                if not success:
+                    error_text = payload.get("error") if isinstance(payload, dict) else payload
+                    self.append_system_message(f"Remove room failed: {error_text}")
+                    return
 
-            self.refresh_rooms()
+                target_room_id = payload.get("room_id")
+                self.append_system_message(f"Room removed (id={target_room_id}).")
+
+                if self.current_room == target_room_id:
+                    self.current_room = None
+                    self.room_name_label.setText("Select a room")
+                    self.message_display.clear()
+                    self.members_list.clear()
+                    if self.websocket_thread:
+                        self.websocket_thread.stop()
+                        self.websocket_thread.wait(1500)
+                        self.websocket_thread = None
+
+                self.refresh_rooms()
+
+            self._run_in_bg(_fetch_delete_room, _apply_delete_room, rest)
             return
 
         if cmd.startswith("!room"):
@@ -2005,18 +2127,33 @@ class ChatWindow(QMainWindow):
             "Images (*.png *.jpg *.jpeg *.gif *.webp)"
         )
         if file_path:
-            success, result = self.api_client.upload_file(self.current_room, file_path)
-            if success:
-                QMessageBox.information(self, "Success", "Image uploaded")
-                self.load_messages()
-            else:
-                QMessageBox.critical(self, "Error", f"Upload failed: {result}")
+            room_id = self.current_room
+
+            def _fetch_upload(rid, path):
+                return self.api_client.upload_file(rid, path)
+
+            def _apply_upload(result):
+                success, payload = result if result else (False, "Upload failed")
+                if success:
+                    QMessageBox.information(self, "Success", "Image uploaded")
+                    if room_id == self.current_room and not (self.websocket_thread and self.websocket_thread.client):
+                        self.load_messages()
+                else:
+                    QMessageBox.critical(self, "Error", f"Upload failed: {payload}")
+
+            self._run_in_bg(_fetch_upload, _apply_upload, room_id, file_path)
     
     def connect_websocket(self):
         """Connect to WebSocket for real-time messaging."""
         if not self.current_room:
             return
         
+        # Stop any existing connection before creating a new one
+        if self.websocket_thread:
+            self.websocket_thread.stop()
+            self.websocket_thread.wait(1500)
+            self.websocket_thread = None
+
         self.websocket_thread = WebSocketThread(
             self.server_url,
             self.api_client.token,
@@ -2032,6 +2169,11 @@ class ChatWindow(QMainWindow):
     
     def on_message_received(self, data: dict):
         """Handle received message."""
+        message_key = self._message_event_key(data)
+        if message_key in self._seen_live_message_keys:
+            return
+        self._seen_live_message_keys.add(message_key)
+
         username = data.get("username", "Unknown")
         content = data.get("content", "")
         msg_type = data.get("message_type", "text")
@@ -2093,12 +2235,15 @@ class ChatWindow(QMainWindow):
         """Create a new room."""
         room_name, ok = QInputDialog.getText(self, "Create Room", "Room name:")
         if ok and room_name:
-            success, result = self.api_client.create_room(room_name)
-            if success:
-                QMessageBox.information(self, "Success", "Room created")
-                self.refresh_rooms()
-            else:
-                QMessageBox.critical(self, "Error", str(result))
+            def _apply_create(result):
+                success, payload = result if result else (False, "Request failed")
+                if success:
+                    QMessageBox.information(self, "Success", "Room created")
+                    self.refresh_rooms()
+                else:
+                    QMessageBox.critical(self, "Error", str(payload))
+
+            self._run_in_bg(self.api_client.create_room, _apply_create, room_name)
     
     def join_room_dialog(self):
         """Show dialog to join another room."""
