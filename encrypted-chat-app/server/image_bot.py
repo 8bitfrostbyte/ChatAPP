@@ -245,7 +245,8 @@ class ImageBot:
             if len(cleaned) == 1:
                 seed = cleaned[0]
                 try:
-                    search = self.search_tags(seed, limit=12)
+                    # Keep start latency low by using a light tag expansion search.
+                    search = self.search_tags(seed, limit=6)
                     for item in search.get("combined", [])[:4]:
                         name = str(item.get("name", "")).strip()
                         if name and name not in cleaned:
@@ -562,9 +563,10 @@ class ImageBot:
             set(rule34_tags.keys()) | set(danbooru_tags.keys()),
             key=lambda name: (-(rule34_tags.get(name, 0) + danbooru_tags.get(name, 0)), name),
         )
-        candidate_names = sample_sorted[: min(max(limit, 80), 160)]
+        # Bound candidate fanout so the endpoint responds quickly in desktop usage.
+        candidate_names = sample_sorted[: min(max(limit, 30), 80)]
 
-        exact_lookup_names = set(candidate_names[: min(30, len(candidate_names))])
+        exact_lookup_names = set(candidate_names[: min(10, len(candidate_names))])
         if normalized in candidate_names:
             exact_lookup_names.add(normalized)
 

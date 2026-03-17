@@ -266,14 +266,14 @@ class APIClient:
             response = requests.post(
                 f"{self.server_url}/api/bot/search",
                 params={"query": query},
-                timeout=10
+                timeout=35
             )
             if response.status_code == 200:
                 return True, response.json()
             else:
-                return False, {}
+                return False, response.json().get("detail", "Bot search request failed")
         except Exception as e:
-            return False, {}
+            return False, str(e)
 
     def fetch_bot_images(self, tags: str, limit: int = 5) -> tuple:
         """Fetch images from the integrated bot."""
@@ -337,7 +337,7 @@ class APIClient:
                 f"{self.server_url}/api/bot/stream/start",
                 params=params,
                 headers=self._get_headers(),
-                timeout=10
+                timeout=20
             )
             if response.status_code == 200:
                 return True, response.json()
