@@ -20,7 +20,7 @@ import requests
 
 # Import our modules
 from database import (
-    init_db, get_db, SessionLocal, User, Room, RoomMember, Message, File as DBFile, Session as DBSession
+    init_db, get_db, SessionLocal, User, Room, RoomMember, RoomInvite, Message, File as DBFile, Session as DBSession
 )
 from auth import (
     auth_manager, UserRegisterRequest, UserLoginRequest, UserResponse, SessionResponse
@@ -536,6 +536,9 @@ async def delete_room(
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
 
+    if not room.is_private:
+        raise HTTPException(status_code=400, detail="Invites are only required for private rooms")
+
     if room.name.strip().lower() == "room one":
         raise HTTPException(status_code=400, detail="Room One cannot be deleted")
 
@@ -780,7 +783,20 @@ async def invite_user_to_room(
     if existing:
         return {"message": f"{username} is already a member of this room"}
 
-    db.add(RoomMember(room_id=room_id, user_id=target.id))
+    pending_invite = db.query(RoomInvite).filter(
+        RoomInvite.room_id == room_id,
+        RoomInvite.invited_user_id == target.id,
+        RoomInvite.status == "pending"
+    ).first()
+    if pending_invite:
+        return {"message": f"Invite already pending for {username}"}
+
+    db.add(RoomInvite(
+        room_id=room_id,
+        inviter_user_id=user.id,
+        invited_user_id=target.id,
+        status="pending"
+    ))
     db.commit()
 
     system_msg_text = f"{username} was invited to the room by {user.username}"
@@ -795,10 +811,115 @@ async def invite_user_to_room(
 
     await manager.broadcast(room_id, {
         "type": "system_message",
+        "room_id": room_id,
         "message": system_msg_text,
     })
 
-    return {"message": f"Invited {username} to the room"}
+    return {"message": f"Invite sent to {username}"}
+
+
+@app.get("/api/invites/pending", response_model=List[Dict])
+async def get_pending_invites(
+    authorization: str = Header(None),
+    db: Session = Depends(get_db)
+):
+    """List pending room invites for the authenticated user."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    token = authorization.split(" ")[1]
+    user, error = auth_manager.verify_token(db, token)
+    if error:
+        raise HTTPException(status_code=401, detail=error)
+
+    invites = db.query(RoomInvite).filter(
+        RoomInvite.invited_user_id == user.id,
+        RoomInvite.status == "pending"
+    ).order_by(RoomInvite.created_at.asc()).all()
+
+    payload = []
+    for inv in invites:
+        room = db.query(Room).filter(Room.id == inv.room_id).first()
+        inviter = db.query(User).filter(User.id == inv.inviter_user_id).first()
+        if not room or not inviter:
+            continue
+        payload.append({
+            "invite_id": inv.id,
+            "room_id": room.id,
+            "room_name": room.name,
+            "inviter_username": inviter.username,
+            "created_at": inv.created_at,
+        })
+
+    return payload
+
+
+@app.post("/api/invites/{invite_id}/respond")
+async def respond_to_invite(
+    invite_id: int,
+    action: str = Query(...),  # accept|decline
+    authorization: str = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Accept or decline a pending room invite."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    token = authorization.split(" ")[1]
+    user, error = auth_manager.verify_token(db, token)
+    if error:
+        raise HTTPException(status_code=401, detail=error)
+
+    normalized = str(action or "").strip().lower()
+    if normalized not in {"accept", "decline"}:
+        raise HTTPException(status_code=400, detail="Action must be 'accept' or 'decline'")
+
+    invite = db.query(RoomInvite).filter(RoomInvite.id == invite_id).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+
+    if invite.invited_user_id != user.id:
+        raise HTTPException(status_code=403, detail="You cannot respond to this invite")
+
+    if invite.status != "pending":
+        return {"message": f"Invite already {invite.status}"}
+
+    room = db.query(Room).filter(Room.id == invite.room_id).first()
+    inviter = db.query(User).filter(User.id == invite.inviter_user_id).first()
+    if not room or not inviter:
+        raise HTTPException(status_code=404, detail="Room or inviter no longer exists")
+
+    if normalized == "accept":
+        existing_member = db.query(RoomMember).filter(
+            RoomMember.room_id == room.id,
+            RoomMember.user_id == user.id
+        ).first()
+        if not existing_member:
+            db.add(RoomMember(room_id=room.id, user_id=user.id))
+        invite.status = "accepted"
+        invite.responded_at = datetime.utcnow()
+        db.commit()
+
+        notice = f"{user.username} accepted an invite to the room"
+        db.add(Message(
+            room_id=room.id,
+            user_id=inviter.id,
+            content=encryption_manager.encrypt_message(room.id, notice),
+            message_type="system"
+        ))
+        db.commit()
+
+        await manager.broadcast(room.id, {
+            "type": "system_message",
+            "room_id": room.id,
+            "message": notice,
+        })
+        return {"message": f"Joined private room '{room.name}'"}
+
+    invite.status = "declined"
+    invite.responded_at = datetime.utcnow()
+    db.commit()
+    return {"message": f"Declined invite to '{room.name}'"}
 
 
 @app.get("/api/rooms/{room_id}/members", response_model=List[Dict])
@@ -1197,6 +1318,23 @@ async def clear_saved_tags():
     return image_bot.clear_tags()
 
 
+def _ensure_bot_room_access(db: Session, user: User, room_id: int) -> Room:
+    """Validate that user can control/view bot stream state for room."""
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    if room.is_private:
+        member = db.query(RoomMember).filter(
+            RoomMember.user_id == user.id,
+            RoomMember.room_id == room_id
+        ).first()
+        if not member and room.created_by != user.id:
+            raise HTTPException(status_code=403, detail="You do not have access to this private room")
+
+    return room
+
+
 @app.post("/api/bot/stream/start")
 async def start_bot_stream(
     room_id: int,
@@ -1214,16 +1352,7 @@ async def start_bot_stream(
     if error:
         raise HTTPException(status_code=401, detail=error)
 
-    room = db.query(Room).filter(Room.id == room_id).first()
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    member = db.query(RoomMember).filter(
-        RoomMember.user_id == user.id,
-        RoomMember.room_id == room_id
-    ).first()
-    if not member:
-        raise HTTPException(status_code=403, detail="Join the room before starting stream")
+    _ensure_bot_room_access(db, user, room_id)
 
     resolved = image_bot.resolve_start_tag_pool(tags)
     tag_pool = resolved["tag_pool"]
@@ -1253,16 +1382,7 @@ async def stop_bot_stream(
     if error:
         raise HTTPException(status_code=401, detail=error)
 
-    room = db.query(Room).filter(Room.id == room_id).first()
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    member = db.query(RoomMember).filter(
-        RoomMember.user_id == user.id,
-        RoomMember.room_id == room_id
-    ).first()
-    if not member:
-        raise HTTPException(status_code=403, detail="Join the room before stopping stream")
+    _ensure_bot_room_access(db, user, room_id)
 
     result = await bot_stream_manager.stop_stream(room_id)
     return {**result, "room_id": room_id}
@@ -1283,16 +1403,7 @@ async def pause_bot_stream(
     if error:
         raise HTTPException(status_code=401, detail=error)
 
-    room = db.query(Room).filter(Room.id == room_id).first()
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    member = db.query(RoomMember).filter(
-        RoomMember.user_id == user.id,
-        RoomMember.room_id == room_id
-    ).first()
-    if not member:
-        raise HTTPException(status_code=403, detail="Join the room before pausing stream")
+    _ensure_bot_room_access(db, user, room_id)
 
     result = await bot_stream_manager.pause_stream(room_id)
     return {**result, "room_id": room_id}
@@ -1313,16 +1424,7 @@ async def resume_bot_stream(
     if error:
         raise HTTPException(status_code=401, detail=error)
 
-    room = db.query(Room).filter(Room.id == room_id).first()
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    member = db.query(RoomMember).filter(
-        RoomMember.user_id == user.id,
-        RoomMember.room_id == room_id
-    ).first()
-    if not member:
-        raise HTTPException(status_code=403, detail="Join the room before resuming stream")
+    _ensure_bot_room_access(db, user, room_id)
 
     result = await bot_stream_manager.resume_stream(room_id)
     return {**result, "room_id": room_id}
@@ -1343,16 +1445,7 @@ async def bot_stream_status(
     if error:
         raise HTTPException(status_code=401, detail=error)
 
-    room = db.query(Room).filter(Room.id == room_id).first()
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    member = db.query(RoomMember).filter(
-        RoomMember.user_id == user.id,
-        RoomMember.room_id == room_id
-    ).first()
-    if not member:
-        raise HTTPException(status_code=403, detail="Join the room before checking stream status")
+    _ensure_bot_room_access(db, user, room_id)
 
     status = bot_stream_manager.get_status(room_id)
     return {"room_id": room_id, **status}

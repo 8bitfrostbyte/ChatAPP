@@ -11,6 +11,7 @@ import json
 import requests
 import subprocess
 import tempfile
+import shlex
 import base64
 import html
 import re
@@ -344,6 +345,35 @@ class APIClient:
             if response.status_code == 200:
                 return True, response.json()
             return False, response.json().get("detail", "Failed to invite user")
+        except Exception as e:
+            return False, str(e)
+
+    def get_pending_invites(self) -> tuple:
+        """Fetch pending room invites for the current user."""
+        try:
+            response = requests.get(
+                f"{self.server_url}/api/invites/pending",
+                headers=self._get_headers(),
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True, response.json()
+            return False, response.json().get("detail", "Failed to fetch invites")
+        except Exception as e:
+            return False, str(e)
+
+    def respond_to_invite(self, invite_id: int, action: str) -> tuple:
+        """Accept or decline a room invite."""
+        try:
+            response = requests.post(
+                f"{self.server_url}/api/invites/{invite_id}/respond",
+                params={"action": action},
+                headers=self._get_headers(),
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True, response.json()
+            return False, response.json().get("detail", "Failed to respond to invite")
         except Exception as e:
             return False, str(e)
     
@@ -879,6 +909,7 @@ class ChatWindow(QMainWindow):
         self._room_list_snapshot = []
         self._rooms_data: Dict[int, dict] = {}  # room_id -> {is_private, created_by}
         self._room_select_epoch = 0
+        self._seen_invite_ids = set()
         self._pending_update_info: Dict = {}
         self._last_update_notice_version = ""
         self.settings_path = self._resolve_settings_path()
@@ -1088,6 +1119,13 @@ class ChatWindow(QMainWindow):
             self.setWindowTitle(f"Encrypted Chat - {self.api_client.username}")
             self.refresh_rooms()
             self.auto_join_default_room()
+            self.check_pending_private_invites()
+
+            self.invites_check_timer = QTimer(self)
+            self.invites_check_timer.setInterval(10000)
+            self.invites_check_timer.timeout.connect(self.check_pending_private_invites)
+            self.invites_check_timer.start()
+
             self.check_for_updates(manual=False)
 
             self.update_check_timer = QTimer(self)
@@ -1096,6 +1134,47 @@ class ChatWindow(QMainWindow):
             self.update_check_timer.start()
             return True
         return False
+
+    def check_pending_private_invites(self):
+        """Poll pending invites and prompt user to accept/decline."""
+        def _apply(result):
+            success, payload = result if result else (False, "Failed to fetch invites")
+            if not success or not isinstance(payload, list):
+                return
+
+            for invite in payload:
+                invite_id = int(invite.get("invite_id", 0) or 0)
+                if invite_id <= 0 or invite_id in self._seen_invite_ids:
+                    continue
+                self._seen_invite_ids.add(invite_id)
+
+                room_name = str(invite.get("room_name", "Unknown Room"))
+                inviter_name = str(invite.get("inviter_username", "Unknown"))
+                prompt = (
+                    f"You have been invited to private room '{room_name}' by {inviter_name}.\n\n"
+                    "Do you want to accept this invite?"
+                )
+                choice = QMessageBox.question(
+                    self,
+                    "Private Room Invite",
+                    prompt,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+
+                action = "accept" if choice == QMessageBox.StandardButton.Yes else "decline"
+
+                def _apply_response(res, selected_action=action):
+                    ok, data = res if res else (False, "Request failed")
+                    if ok:
+                        self.append_system_message(data.get("message", f"Invite {selected_action}ed"))
+                        self.refresh_rooms()
+                    else:
+                        self.append_system_message(f"Invite response failed: {data}")
+
+                self._run_in_bg(self.api_client.respond_to_invite, _apply_response, invite_id, action)
+
+        self._run_in_bg(self.api_client.get_pending_invites, _apply)
 
     def check_for_updates(self, manual: bool = False, done_callback=None):
         """Check server-managed GitHub update status and announce in-app when available."""
@@ -1929,7 +2008,7 @@ class ChatWindow(QMainWindow):
             "!createroom <name> [private] - Create a new room",
             "!removeroom <name|id> - Delete a room (creator-only)",
             "!makeprivate - Make current room private (creator-only)",
-            "!invite <username> - Invite a user to current room (creator-only)",
+            "!invite <username> <room_name|id> - Invite user to room (creator-only)",
             "!clear <count> - Clear recent non-system messages in this room",
             "!saveimages [folder_path] - Save all image URLs currently visible in chat to a folder",
             "!room clear <count> - Alias for clearing recent room messages",
@@ -2392,14 +2471,46 @@ class ChatWindow(QMainWindow):
         if cmd.startswith("!invite"):
             rest = cmd[len("!invite"):].strip()
             if not rest:
-                self.append_system_message("Usage: !invite <username>")
-                return
-            if not self.current_room:
-                self.append_system_message("Join a room first, then run !invite <username>")
+                self.append_system_message("Usage: !invite <username> <room_name_or_id>")
                 return
 
-            room_id = self.current_room
-            username = rest
+            try:
+                args = shlex.split(rest)
+            except ValueError:
+                self.append_system_message("Invite failed: invalid quoting in command.")
+                return
+
+            if not args:
+                self.append_system_message("Usage: !invite <username> <room_name_or_id>")
+                return
+
+            username = args[0].strip()
+            room_selector = " ".join(args[1:]).strip() if len(args) > 1 else ""
+
+            if not username:
+                self.append_system_message("Usage: !invite <username> <room_name_or_id>")
+                return
+
+            # Backward compatibility: !invite <username> uses current room.
+            if not room_selector:
+                if not self.current_room:
+                    self.append_system_message("Join a room first, then run !invite <username> <room_name_or_id>")
+                    return
+                room_id = self.current_room
+            else:
+                room_id = None
+                if room_selector.isdigit():
+                    room_id = int(room_selector)
+                else:
+                    normalized_room = room_selector.lower()
+                    for rid, info in self._rooms_data.items():
+                        room_name = str(info.get("name", "")).strip().lower()
+                        if room_name == normalized_room:
+                            room_id = int(rid)
+                            break
+                if room_id is None:
+                    self.append_system_message(f"Invite failed: room not found '{room_selector}'. Use !rooms to list room names/ids.")
+                    return
 
             def _apply_invite(result):
                 success, payload = result if result else (False, "Request failed")
@@ -3406,6 +3517,8 @@ class ChatWindow(QMainWindow):
         self._save_user_settings()
         if hasattr(self, "members_refresh_timer") and self.members_refresh_timer is not None:
             self.members_refresh_timer.stop()
+        if hasattr(self, "invites_check_timer") and self.invites_check_timer is not None:
+            self.invites_check_timer.stop()
         if hasattr(self, "update_check_timer") and self.update_check_timer is not None:
             self.update_check_timer.stop()
         if self.current_room:

@@ -35,6 +35,18 @@ class User(Base):
     # Relationships
     messages = relationship("Message", back_populates="user", cascade="all, delete-orphan")
     room_members = relationship("RoomMember", back_populates="user", cascade="all, delete-orphan")
+    sent_room_invites = relationship(
+        "RoomInvite",
+        foreign_keys="RoomInvite.inviter_user_id",
+        back_populates="inviter",
+        cascade="all, delete-orphan",
+    )
+    received_room_invites = relationship(
+        "RoomInvite",
+        foreign_keys="RoomInvite.invited_user_id",
+        back_populates="invited_user",
+        cascade="all, delete-orphan",
+    )
     sessions = relationship("Session", back_populates="user", cascade="all, delete-orphan")
     
     def __repr__(self):
@@ -55,6 +67,7 @@ class Room(Base):
     # Relationships
     messages = relationship("Message", back_populates="room", cascade="all, delete-orphan")
     members = relationship("RoomMember", back_populates="room", cascade="all, delete-orphan")
+    invites = relationship("RoomInvite", back_populates="room", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Room {self.name}>"
@@ -79,6 +92,30 @@ class RoomMember(Base):
     
     def __repr__(self):
         return f"<RoomMember user_id={self.user_id} room_id={self.room_id}>"
+
+
+class RoomInvite(Base):
+    """Pending invite flow for private rooms (accept/decline)."""
+    __tablename__ = "room_invites"
+
+    id = Column(Integer, primary_key=True, index=True)
+    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False, index=True)
+    inviter_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    invited_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="pending", index=True)  # pending|accepted|declined
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    responded_at = Column(DateTime, nullable=True)
+
+    room = relationship("Room", back_populates="invites")
+    inviter = relationship("User", foreign_keys=[inviter_user_id], back_populates="sent_room_invites")
+    invited_user = relationship("User", foreign_keys=[invited_user_id], back_populates="received_room_invites")
+
+    __table_args__ = (
+        UniqueConstraint("room_id", "invited_user_id", "status", name="uq_room_invites_room_user_status"),
+    )
+
+    def __repr__(self):
+        return f"<RoomInvite room_id={self.room_id} invited_user_id={self.invited_user_id} status={self.status}>"
 
 
 class Message(Base):
