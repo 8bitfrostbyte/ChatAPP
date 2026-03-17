@@ -123,19 +123,30 @@ class BotStreamManager:
 
     async def _run_stream(self, room_id: int, interval: float, tag_pool: List[str], mode: str):
         try:
+            image_bot.config.image_history = []
+            await asyncio.to_thread(image_bot.prime_buffer, tag_pool)
             await self._post_bot_message(
                 room_id,
                 f"Image stream started: every {interval:g}s | mode: {mode} | tags: {', '.join(tag_pool)}"
             )
+            miss_count = 0
             while True:
-                selected_tag = random.choice(tag_pool) if tag_pool else "rating:explicit"
-                images = await asyncio.to_thread(image_bot.fetch_images, selected_tag, 1)
-                if images:
-                    img = images[0]
-                    url = img.get("url")
-                    if url:
-                        msg = f"{url}\nQuery: {selected_tag}\nTags: {img.get('tags', '')}"
-                        await self._post_bot_message(room_id, msg)
+                image_post = await asyncio.to_thread(image_bot.fetch_buffered_image, tag_pool)
+                if image_post and image_post.get("url"):
+                    msg = (
+                        f"Tags: {image_bot.format_tags_for_log(image_post.get('tags', ''), max_tags=20)}\n"
+                        f"Query: {image_post.get('query_tag', 'rating:explicit')}\n"
+                        f"{image_post['url']}"
+                    )
+                    await self._post_bot_message(room_id, msg)
+                    miss_count = 0
+                else:
+                    miss_count += 1
+                    if miss_count in {1, 5}:
+                        await self._post_bot_message(
+                            room_id,
+                            "No image result right now. Retrying..."
+                        )
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             raise
@@ -732,6 +743,72 @@ async def delete_message(
     return {"message": "Message deleted"}
 
 
+@app.post("/api/rooms/{room_id}/clear")
+async def clear_room_messages(
+    room_id: int,
+    count: int = Query(1, ge=1, le=500),
+    authorization: str = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Clear recent messages in a room.
+
+    - Room creator can clear any recent user/bot/image messages.
+    - Non-creator can clear only their own recent messages.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    token = authorization.split(" ")[1]
+    user, error = auth_manager.verify_token(db, token)
+    if error:
+        raise HTTPException(status_code=401, detail=error)
+
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    member = db.query(RoomMember).filter(
+        RoomMember.user_id == user.id,
+        RoomMember.room_id == room_id
+    ).first()
+    if not member:
+        raise HTTPException(status_code=403, detail="Join the room before clearing messages")
+
+    query = db.query(Message).filter(
+        Message.room_id == room_id,
+        Message.deleted_at == None,
+        Message.message_type != "system"
+    )
+
+    if room.created_by != user.id:
+        query = query.filter(Message.user_id == user.id)
+
+    target_messages = query.order_by(Message.created_at.desc()).limit(count).all()
+
+    if not target_messages:
+        return {"deleted": 0, "message": "No matching messages to clear"}
+
+    now = datetime.utcnow()
+    deleted_ids = []
+    for msg in target_messages:
+        msg.deleted_at = now
+        deleted_ids.append(msg.id)
+
+    db.commit()
+
+    for msg_id in deleted_ids:
+        await manager.broadcast(room_id, {
+            "type": "message_deleted",
+            "message_id": msg_id
+        })
+
+    return {
+        "deleted": len(deleted_ids),
+        "message": f"Cleared {len(deleted_ids)} message(s)",
+        "scope": "room" if room.created_by == user.id else "own"
+    }
+
+
 # ================================
 # FILE/IMAGE ENDPOINTS
 # ================================
@@ -859,7 +936,8 @@ async def remove_blacklist(tags: str):
 async def get_saved_tags():
     """Get saved/start tags used by start command."""
     return {
-        "saved_tags": image_bot.get_saved_tags()
+        "saved_tags": image_bot.get_saved_tags(),
+        "start_tags": image_bot.get_start_tags()
     }
 
 

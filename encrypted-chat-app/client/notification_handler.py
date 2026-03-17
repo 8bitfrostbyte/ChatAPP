@@ -69,9 +69,12 @@ class NotificationHandler:
             if self.notification_sound and os.path.exists(self.notification_sound):
                 playsound(self.notification_sound)
             else:
-                # Windows beep (builtin)
                 import winsound
-                winsound.Beep(1000, 500)  # 1000 Hz, 500ms
+                try:
+                    # Soft Windows "asterisk" info ding, played async (non-blocking)
+                    winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+                except Exception:
+                    winsound.Beep(440, 80)  # quiet fallback
         except Exception as e:
             print(f"Failed to play sound: {e}")
     
@@ -80,21 +83,11 @@ class NotificationHandler:
         self.sound_enabled = enabled
     
     def notify_message_received(self, username: str, preview: str = ""):
-        """Show notification for received message."""
+        """Play sound for a message received from another user."""
         self.play_sound()
-        
-        title = f"Message from {username}"
-        message = preview if preview else "New message received"
-        self.show_notification(title, message)
-    
+
     def notify_user_joined(self, username: str):
-        """Show notification for user joining."""
-        title = "User Joined"
-        message = f"{username} joined the room"
-        self.show_notification(title, message)
-    
+        pass
+
     def notify_user_left(self, username: str):
-        """Show notification for user leaving."""
-        title = "User Left"
-        message = f"{username} left the room"
-        self.show_notification(title, message)
+        pass

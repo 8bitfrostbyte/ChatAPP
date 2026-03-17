@@ -40,6 +40,7 @@ venv\Scripts\activate
 
 ```cmd
 # Make sure you're in the client directory with venv activated
+python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 
 # This will install:
@@ -48,6 +49,13 @@ pip install -r requirements.txt
 # - Cryptography (encryption)
 # - Requests (HTTP client)
 # - Playsound (notification sounds)
+```
+
+If you see `Failed to build 'pillow' when getting requirements to build wheel`, run:
+
+```cmd
+pip install "pillow>=11.0.0"
+pip install -r requirements.txt --prefer-binary
 ```
 
 ## Step 4: Configure Server URL
@@ -203,12 +211,31 @@ First time setup:
 **Solutions:**
 1. Check Python version: `python --version` (must be 3.10+)
 2. Verify dependencies: `pip list` should show PyQt6, websockets, etc.
-3. Reinstall dependencies: 
+3. Reinstall dependencies:
    ```cmd
    pip uninstall -r requirements.txt -y
-   pip install -r requirements.txt
+   python -m pip install --upgrade pip setuptools wheel
+   pip install -r requirements.txt --prefer-binary
    ```
 4. Check for error logs: Look for error messages in console
+
+### Pillow Wheel Build Error
+
+**Problem:** `ERROR: Failed to build 'pillow' when getting requirements to build wheel`
+**Solutions:**
+1. Upgrade packaging tools:
+   ```cmd
+   python -m pip install --upgrade pip setuptools wheel
+   ```
+2. Install a newer compatible Pillow:
+   ```cmd
+   pip install "pillow>=11.0.0"
+   ```
+3. Reinstall requirements preferring binary wheels:
+   ```cmd
+   pip install -r requirements.txt --prefer-binary
+   ```
+4. If still failing, use Python 3.11 for client packaging/build tasks.
 
 ## Advanced Configuration
 
@@ -231,7 +258,7 @@ If your server uses self-signed HTTPS:
 From any chat room, you can search for images:
 
 1. Use keyboard shortcut Ctrl+B (future feature)
-2. Or type command: `/bot search <tags>`
+2. Or type command: `!bot search <tags>`
 3. Bot will search Rule34 and Danbooru sites
 4. Results appear in chat as clickable links
 
@@ -302,19 +329,37 @@ Security: VPN encrypted, private network
 4. **Optimize server connection:** Use same network when possible
 5. **Disable notifications:** If battery critical
 
-## Creating Shortcut
+## Launchable App Options
 
-Create a Windows shortcut to launch the app easily:
+You can run the client like a normal launchable app without changing any server setup.
+
+### Option 1: Desktop Shortcut (Fastest)
 
 1. Right-click on Desktop
 2. Create New → Shortcut
-3. Location: 
+3. Location:
    ```
    cmd /k cd C:\Users\YourUsername\Desktop\encrypted-chat-app\client && venv\Scripts\python main.py
    ```
 4. Name: "Encrypted Chat"
 5. Click Finish
 6. (Optional) Right-click → Properties → Change Icon
+
+### Option 2: Build a Standalone .EXE (Best User Experience)
+
+```cmd
+cd C:\Users\YourUsername\Desktop\encrypted-chat-app\client
+venv\Scripts\activate
+pip install pyinstaller
+pyinstaller --noconfirm --windowed --onefile --name EncryptedChat main.py
+```
+
+After build, run:
+- `dist\EncryptedChat.exe`
+
+Notes:
+- No server-side changes required.
+- Rebuild the `.exe` after client code updates.
 
 ## Uninstalling
 

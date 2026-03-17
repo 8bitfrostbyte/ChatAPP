@@ -1,30 +1,42 @@
 """
-Integrated Image Bot Service - Adapted from botUpdated.py
-Searches and streams images from Rule34 and Danbooru APIs
+Integrated Image Bot Service - non-Discord logic ported from botUpdated.py.
+Searches and streams images from Rule34 and Danbooru APIs.
 """
 
-import requests
-from curl_cffi import requests as curi_requests
-import asyncio
 import json
 import os
 import random
+import threading
 import xml.etree.ElementTree as ET
-from typing import List, Dict, Optional
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from sqlalchemy.orm import Session
-from database import Message, Room
+from typing import Dict, List, Optional, Tuple
+
+import requests
+from curl_cffi import requests as curi_requests
+
+
+VERBOSE_LOGS = False
+
+
+def log_info(message: str):
+    print(message)
+
+
+def log_verbose(message: str):
+    if VERBOSE_LOGS:
+        print(message)
 
 
 class ImageBotConfig:
     """Configuration for the image bot."""
-    
+
     def __init__(self):
         self.danbooru_username = os.getenv("DANBOORU_USER", "")
         self.danbooru_api_key = os.getenv("DANBOORU_API_KEY", "")
         self.rule34_user_id = os.getenv("RULE34_USER_ID", "")
         self.rule34_api_key = os.getenv("RULE34_API_KEY", "")
-        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         self.blacklist_tags = set()
         self.saved_tags = set()
         self.start_tags = set()
@@ -34,9 +46,15 @@ class ImageBotConfig:
 
 class ImageBot:
     """Handles image search and streaming from APIs."""
-    
+
+    BUFFER_LOW_MARK = 30
+
     def __init__(self):
         self.config = ImageBotConfig()
+        self._post_buffer = deque()
+        self._buffer_lock = threading.Lock()
+        self._refill_in_progress = False
+        self._buffer_signature: Tuple[str, ...] = tuple()
         self.load_blacklist()
         self.load_saved_tags()
 
@@ -45,20 +63,65 @@ class ImageBot:
         """Parse comma-separated tags."""
         if not tags:
             return []
-        return [t.strip() for t in tags.split(',') if t.strip()]
-    
+        return [t.strip() for t in tags.split(",") if t.strip()]
+
+    @staticmethod
+    def format_tags_for_log(tags, max_tags: int = 10) -> str:
+        """Pretty-print tags with truncation for logs/messages."""
+        if not tags:
+            return "(no tags)"
+
+        if isinstance(tags, str):
+            parts = [t for t in tags.split() if t.strip()]
+        elif isinstance(tags, list):
+            parts = [str(t).strip() for t in tags if str(t).strip()]
+        else:
+            parts = [str(tags).strip()]
+
+        shown = parts[:max_tags]
+        hidden_count = max(len(parts) - max_tags, 0)
+        suffix = f" (+{hidden_count} more)" if hidden_count else ""
+        return " | ".join(shown) + suffix
+
+    @staticmethod
+    def _to_int(value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def matches_search_query(tag_name: str, query: str) -> bool:
+        """Check if a tag matches the search query."""
+        name = str(tag_name or "").strip().lower()
+        q = str(query or "").strip().lower()
+        if not name or not q:
+            return False
+
+        if name == q:
+            return True
+        if name.startswith(f"{q}_"):
+            return True
+        if name.endswith(f"_{q}"):
+            return True
+        if f"_{q}_" in name:
+            return True
+        return name.startswith(q)
+
     def load_blacklist(self):
         """Load blacklist from file if it exists."""
         blacklist_file = "blacklist_tags.json"
-        if os.path.exists(blacklist_file):
-            try:
-                with open(blacklist_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        self.config.blacklist_tags = {str(tag).strip() for tag in data}
-            except Exception as e:
-                print(f"Failed to load blacklist: {e}")
-    
+        if not os.path.exists(blacklist_file):
+            return
+
+        try:
+            with open(blacklist_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.config.blacklist_tags = {str(tag).strip() for tag in data if str(tag).strip()}
+        except Exception as e:
+            print(f"Failed to load blacklist: {e}")
+
     def save_blacklist(self):
         """Save blacklist to file."""
         try:
@@ -92,7 +155,7 @@ class ImageBot:
         try:
             payload = {
                 "saved_tags": sorted(self.config.saved_tags),
-                "start_tags": sorted(self.config.start_tags)
+                "start_tags": sorted(self.config.start_tags),
             }
             with open("saved_tags.json", "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=True, indent=2)
@@ -110,7 +173,7 @@ class ImageBot:
         return {
             "added": added,
             "saved_tags": sorted(self.config.saved_tags),
-            "start_tags": sorted(self.config.start_tags)
+            "start_tags": sorted(self.config.start_tags),
         }
 
     def remove_tags(self, tags: str) -> Dict:
@@ -133,7 +196,7 @@ class ImageBot:
         return {
             "removed": removed,
             "saved_tags": sorted(self.config.saved_tags),
-            "start_tags": sorted(self.config.start_tags)
+            "start_tags": sorted(self.config.start_tags),
         }
 
     def clear_tags(self) -> Dict:
@@ -145,20 +208,19 @@ class ImageBot:
         return {
             "removed": removed,
             "saved_tags": [],
-            "start_tags": []
+            "start_tags": [],
         }
 
     def get_saved_tags(self) -> List[str]:
         """Return current saved tags."""
         return sorted(self.config.saved_tags)
 
-    def resolve_start_tag_pool(self, start_tags_input: Optional[str]) -> Dict:
-        """Resolve start behavior like Discord bot.
+    def get_start_tags(self) -> List[str]:
+        """Return current start tags."""
+        return sorted(self.config.start_tags)
 
-        - If tags were provided on start: use those tags and save them.
-        - If no tags were provided and saved start tags exist: use saved start tags.
-        - If no tags provided and no saved tags: random mode.
-        """
+    def resolve_start_tag_pool(self, start_tags_input: Optional[str]) -> Dict:
+        """Resolve start behavior like the original bot."""
         if start_tags_input and start_tags_input.strip():
             parsed = self.parse_tag_list(start_tags_input)
             if parsed:
@@ -171,255 +233,450 @@ class ImageBot:
             return {"mode": "saved", "tag_pool": sorted(self.config.start_tags), "saved": False}
 
         return {"mode": "random", "tag_pool": ["rating:explicit"], "saved": False}
-    
-    @staticmethod
-    def matches_search_query(tag_name: str, query: str) -> bool:
-        """Check if a tag matches the search query."""
-        name = str(tag_name or "").strip().lower()
-        q = str(query or "").strip().lower()
-        if not name or not q:
-            return False
-        
-        if name == q:
-            return True
-        if name.startswith(f"{q}_"):
-            return True
-        if name.endswith(f"_{q}"):
-            return True
-        if f"_{q}_" in name:
-            return True
-        return name.startswith(q)
-    
-    def get_matching_blacklist_tags(self, tags: str) -> List[str]:
+
+    def get_matching_blacklist_tags(self, tags) -> List[str]:
         """Get blacklist tags that match the given tags."""
         if not tags or not self.config.blacklist_tags:
             return []
-        
-        tag_set = {tag.strip().lower() for tag in tags.split() if tag.strip()}
+
+        if isinstance(tags, str):
+            tag_set = {tag.strip().lower() for tag in tags.split() if tag.strip()}
+        elif isinstance(tags, list):
+            tag_set = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+        else:
+            tag_set = {str(tags).strip().lower()}
+
         blacklist_set = {tag.lower() for tag in self.config.blacklist_tags}
         return sorted(tag for tag in blacklist_set if tag in tag_set)
-    
+
     def _search_rule34_tags(self, query: str, limit: int = 50) -> Dict[str, int]:
         """Search for tags on Rule34."""
         pages_to_scan = 12
-        counts = {}
-        
+
         def fetch_rule34_page(pid):
             page_counts = {}
             params = {
-                'page': 'dapi',
-                's': 'post',
-                'q': 'index',
-                'json': 1,
-                'limit': 100,
-                'pid': pid,
-                'tags': query
+                "page": "dapi",
+                "s": "post",
+                "q": "index",
+                "json": 1,
+                "limit": 100,
+                "pid": pid,
+                "tags": query,
             }
             if self.config.rule34_user_id and self.config.rule34_api_key:
-                params['user_id'] = self.config.rule34_user_id
-                params['api_key'] = self.config.rule34_api_key
-            
+                params["user_id"] = self.config.rule34_user_id
+                params["api_key"] = self.config.rule34_api_key
+
             try:
                 response = requests.get(
-                    'https://api.rule34.xxx',
+                    "https://api.rule34.xxx",
                     params=params,
                     headers=self.config.headers,
-                    timeout=10
+                    timeout=10,
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    if isinstance(data, list):
-                        for post in data:
-                            post_tags = str(post.get("tags", "")).split()
-                            for tag in post_tags:
-                                tag_clean = tag.strip().lower()
-                                if self.matches_search_query(tag_clean, query):
-                                    page_counts[tag_clean] = page_counts.get(tag_clean, 0) + 1
+                if response.status_code != 200:
+                    return page_counts
+
+                body = response.text.strip()
+                if not body:
+                    return page_counts
+
+                data = response.json()
+                if not isinstance(data, list):
+                    return page_counts
+
+                for post in data:
+                    post_tags = {
+                        tag.strip().lower()
+                        for tag in str(post.get("tags", "")).split()
+                        if tag.strip()
+                    }
+                    for tag in post_tags:
+                        if not self.matches_search_query(tag, query):
+                            continue
+                        page_counts[tag] = page_counts.get(tag, 0) + 1
             except Exception:
-                pass
-            
+                return page_counts
+
             return page_counts
-        
+
+        counts = {}
         with ThreadPoolExecutor(max_workers=6) as executor:
             futures = [executor.submit(fetch_rule34_page, pid) for pid in range(pages_to_scan)]
             for future in as_completed(futures):
                 page_counts = future.result()
                 for tag, value in page_counts.items():
                     counts[tag] = counts.get(tag, 0) + value
-        
+
         return counts
-    
+
     def _search_danbooru_tags(self, query: str, limit: int = 50) -> Dict[str, int]:
         """Search for tags on Danbooru."""
-        counts = {}
         auth = None
         if self.config.danbooru_username and self.config.danbooru_api_key:
             auth = (self.config.danbooru_username, self.config.danbooru_api_key)
-        
+
         def fetch_danbooru_page(page):
             page_counts = {}
             params = {
-                'tags': query,
-                'limit': 200,
-                'page': page
+                "tags": query,
+                "limit": 200,
+                "page": page,
             }
             try:
                 response = curi_requests.get(
-                    'https://danbooru.donmai.us/posts.json',
+                    "https://danbooru.donmai.us/posts.json",
                     params=params,
                     auth=auth,
                     impersonate="chrome110",
-                    timeout=10
+                    timeout=10,
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    if isinstance(data, list):
-                        for post in data:
-                            post_tags = str(post.get("tag_string", "")).split()
-                            for tag in post_tags:
-                                tag_clean = tag.strip().lower()
-                                if self.matches_search_query(tag_clean, query):
-                                    page_counts[tag_clean] = page_counts.get(tag_clean, 0) + 1
+                if response.status_code != 200:
+                    return page_counts
+
+                data = response.json()
+                if not isinstance(data, list):
+                    return page_counts
+
+                for post in data:
+                    post_tags = {
+                        tag.strip().lower()
+                        for tag in str(post.get("tag_string", "")).split()
+                        if tag.strip()
+                    }
+                    for tag in post_tags:
+                        if not self.matches_search_query(tag, query):
+                            continue
+                        page_counts[tag] = page_counts.get(tag, 0) + 1
             except Exception:
-                pass
-            
+                return page_counts
+
             return page_counts
-        
+
+        counts = {}
         with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(fetch_danbooru_page, page) for page in range(1, 5)]
+            futures = [executor.submit(fetch_danbooru_page, page) for page in range(1, 8)]
             for future in as_completed(futures):
                 page_counts = future.result()
                 for tag, value in page_counts.items():
                     counts[tag] = counts.get(tag, 0) + value
-        
+
         return counts
-    
+
+    def _get_rule34_association_count(self, base_tag: str, related_tag: str):
+        tags = base_tag if base_tag == related_tag else f"{base_tag} {related_tag}"
+        params = {
+            "page": "dapi",
+            "s": "post",
+            "q": "index",
+            "limit": 1,
+            "tags": tags,
+        }
+        if self.config.rule34_user_id and self.config.rule34_api_key:
+            params["user_id"] = self.config.rule34_user_id
+            params["api_key"] = self.config.rule34_api_key
+
+        try:
+            response = requests.get(
+                "https://api.rule34.xxx",
+                params=params,
+                headers=self.config.headers,
+                timeout=12,
+            )
+            if response.status_code != 200:
+                return 0
+
+            root = ET.fromstring(response.text)
+            if root.tag != "posts":
+                return 0
+            return self._to_int(root.attrib.get("count", 0), 0)
+        except Exception:
+            return None
+
+    def _get_danbooru_association_count(self, base_tag: str, related_tag: str):
+        tags = base_tag if base_tag == related_tag else f"{base_tag} {related_tag}"
+        params = {"tags": tags}
+        auth = None
+        if self.config.danbooru_username and self.config.danbooru_api_key:
+            auth = (self.config.danbooru_username, self.config.danbooru_api_key)
+
+        try:
+            response = curi_requests.get(
+                "https://danbooru.donmai.us/counts/posts.json",
+                params=params,
+                auth=auth,
+                impersonate="chrome110",
+                timeout=12,
+            )
+            if response.status_code != 200:
+                return None
+
+            data = response.json()
+            if isinstance(data, dict):
+                counts = data.get("counts", {})
+                if isinstance(counts, dict):
+                    return self._to_int(counts.get("posts", 0), 0)
+            return None
+        except Exception:
+            return None
+
     def search_tags(self, query: str, limit: int = 50) -> Dict:
-        """Search tags across both APIs."""
+        """Search tags across APIs with exact-count enrichment for top matches."""
         normalized = query.strip().lower().replace(" ", "_")
         if not normalized:
             return {"query": "", "rule34": {}, "danbooru": {}, "combined": []}
-        
+
         rule34_tags = self._search_rule34_tags(normalized, limit=limit)
         danbooru_tags = self._search_danbooru_tags(normalized, limit=limit)
-        
-        combined_entries = []
+
         sample_sorted = sorted(
             set(rule34_tags.keys()) | set(danbooru_tags.keys()),
-            key=lambda name: (-(rule34_tags.get(name, 0) + danbooru_tags.get(name, 0)), name)
+            key=lambda name: (-(rule34_tags.get(name, 0) + danbooru_tags.get(name, 0)), name),
         )
-        
-        for name in sample_sorted[:min(limit, len(sample_sorted))]:
-            r34_count = rule34_tags.get(name, 0)
-            dan_count = danbooru_tags.get(name, 0)
-            combined_entries.append({
-                "name": name,
-                "count": r34_count + dan_count,
-                "rule34_count": r34_count,
-                "danbooru_count": dan_count
-            })
-        
+        candidate_names = sample_sorted[: min(max(limit, 80), 160)]
+
+        exact_lookup_names = set(candidate_names[: min(30, len(candidate_names))])
+        if normalized in candidate_names:
+            exact_lookup_names.add(normalized)
+
+        exact_counts = {}
+
+        def fetch_exact_counts(tag_name):
+            return (
+                tag_name,
+                self._get_rule34_association_count(normalized, tag_name),
+                self._get_danbooru_association_count(normalized, tag_name),
+            )
+
+        if exact_lookup_names:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(fetch_exact_counts, name) for name in exact_lookup_names]
+                for future in as_completed(futures):
+                    try:
+                        name, r34_exact, dan_exact = future.result()
+                        exact_counts[name] = (r34_exact, dan_exact)
+                    except Exception:
+                        continue
+
+        combined_entries = []
+        for name in candidate_names:
+            r34_exact, dan_exact = exact_counts.get(name, (None, None))
+            r34_count = r34_exact if r34_exact is not None else rule34_tags.get(name, 0)
+            dan_count = dan_exact if dan_exact is not None else danbooru_tags.get(name, 0)
+            combined_entries.append(
+                {
+                    "name": name,
+                    "count": r34_count + dan_count,
+                    "rule34_count": r34_count,
+                    "danbooru_count": dan_count,
+                }
+            )
+
+        combined = sorted(combined_entries, key=lambda item: (-item["count"], item["name"]))
         return {
             "query": normalized,
             "rule34": rule34_tags,
             "danbooru": danbooru_tags,
-            "combined": combined_entries
+            "combined": combined,
         }
-    
-    def fetch_images(self, tags: str, limit: int = 10) -> List[Dict]:
-        """Fetch images for given tags."""
+
+    def _fetch_one_tag(self, tag_param: str, limit: int = 100) -> List[Dict]:
+        """Fetch posts for a single tag from Rule34 and Danbooru."""
         results = []
-        
+
         # Rule34
         try:
             params = {
-                'page': 'dapi',
-                's': 'post',
-                'q': 'index',
-                'json': 1,
-                'limit': limit,
-                'pid': random.randint(0, 20),
-                'tags': tags
+                "page": "dapi",
+                "s": "post",
+                "q": "index",
+                "json": 1,
+                "limit": limit,
+                "pid": random.randint(0, 50),
+                "tags": tag_param,
             }
             if self.config.rule34_user_id and self.config.rule34_api_key:
-                params['user_id'] = self.config.rule34_user_id
-                params['api_key'] = self.config.rule34_api_key
-            
+                params["user_id"] = self.config.rule34_user_id
+                params["api_key"] = self.config.rule34_api_key
+
             response = requests.get(
-                'https://api.rule34.xxx',
+                "https://api.rule34.xxx",
                 params=params,
                 headers=self.config.headers,
-                timeout=15
+                timeout=15,
             )
             if response.status_code == 200:
                 data = response.json()
                 if isinstance(data, list):
                     for post in data:
-                        post_tags = post.get('tags', '')
-                        if not self.get_matching_blacklist_tags(post_tags):
-                            url = post.get('file_url')
-                            if url:
-                                results.append({
-                                    "url": url,
-                                    "tags": post_tags,
-                                    "api": "rule34"
-                                })
+                        post_tags = post.get("tags", "")
+                        if self.get_matching_blacklist_tags(post_tags):
+                            continue
+                        url = post.get("file_url")
+                        if url:
+                            results.append({"url": url, "tags": post_tags, "api": "rule34", "query_tag": tag_param})
         except Exception as e:
-            print(f"Rule34 fetch error: {e}")
-        
+            log_verbose(f"Buffer fetch error rule34 ({tag_param}): {e}")
+
         # Danbooru
-        if self.config.danbooru_username and self.config.danbooru_api_key:
-            try:
-                params = {
-                    'tags': tags,
-                    'limit': limit,
-                    'random': 'true'
-                }
-                response = curi_requests.get(
-                    'https://danbooru.donmai.us/posts.json',
-                    params=params,
-                    auth=(self.config.danbooru_username, self.config.danbooru_api_key),
-                    impersonate="chrome110",
-                    timeout=15
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    if isinstance(data, list):
-                        for post in data:
-                            post_tags = post.get('tag_string', '')
-                            if not self.get_matching_blacklist_tags(post_tags):
-                                url = post.get('file_url') or post.get('large_file_url')
-                                if url:
-                                    results.append({
-                                        "url": url,
-                                        "tags": post_tags,
-                                        "api": "danbooru"
-                                    })
-            except Exception as e:
-                print(f"Danbooru fetch error: {e}")
-        
-        random.shuffle(results)
+        try:
+            params = {
+                "tags": tag_param,
+                "limit": min(limit, 100),
+                "random": "true",
+            }
+            auth = None
+            if self.config.danbooru_username and self.config.danbooru_api_key:
+                auth = (self.config.danbooru_username, self.config.danbooru_api_key)
+
+            response = curi_requests.get(
+                "https://danbooru.donmai.us/posts.json",
+                params=params,
+                auth=auth,
+                impersonate="chrome110",
+                timeout=15,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list):
+                    for post in data:
+                        post_tags = post.get("tag_string", "")
+                        if self.get_matching_blacklist_tags(post_tags):
+                            continue
+                        url = post.get("file_url") or post.get("large_file_url")
+                        if url:
+                            results.append({"url": url, "tags": post_tags, "api": "danbooru", "query_tag": tag_param})
+        except Exception as e:
+            log_verbose(f"Buffer fetch error danbooru ({tag_param}): {e}")
+
         return results
-    
+
+    def _fetch_posts_into_buffer(self, tag_pool: List[str]):
+        """Fetch posts for all tags in parallel and push into shared buffer."""
+        self._refill_in_progress = True
+        try:
+            tags = [t.strip() for t in (tag_pool or []) if t and t.strip()]
+            if not tags:
+                tags = ["rating:explicit"]
+
+            new_posts = []
+            workers = max(1, min(len(tags), 8))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(self._fetch_one_tag, tag, 100) for tag in tags]
+                for future in as_completed(futures):
+                    try:
+                        new_posts.extend(future.result())
+                    except Exception:
+                        continue
+
+            if new_posts:
+                random.shuffle(new_posts)
+                with self._buffer_lock:
+                    self._post_buffer.extend(new_posts)
+                log_verbose(
+                    f"Buffer refilled: {len(new_posts)} posts from {len(tags)} tag(s) (total: {len(self._post_buffer)})"
+                )
+        finally:
+            self._refill_in_progress = False
+
+    def _trigger_refill(self, tag_pool: List[str]):
+        """Start background refill if one is not in progress."""
+        if not self._refill_in_progress:
+            threading.Thread(target=self._fetch_posts_into_buffer, args=(list(tag_pool),), daemon=True).start()
+
+    def prime_buffer(self, tag_pool: List[str]):
+        """Pre-warm post buffer for a stream's tag pool."""
+        signature = tuple(sorted(t.strip() for t in tag_pool if t and t.strip()))
+        with self._buffer_lock:
+            if signature != self._buffer_signature:
+                self._post_buffer.clear()
+                self._buffer_signature = signature
+        self._fetch_posts_into_buffer(tag_pool)
+
+    def fetch_buffered_image(self, tag_pool: List[str]) -> Optional[Dict]:
+        """Fetch one non-duplicate image using a buffered pipeline."""
+        normalized_pool = [t.strip() for t in (tag_pool or []) if t and t.strip()]
+        if not normalized_pool:
+            normalized_pool = ["rating:explicit"]
+
+        signature = tuple(sorted(normalized_pool))
+        with self._buffer_lock:
+            if signature != self._buffer_signature:
+                self._post_buffer.clear()
+                self._buffer_signature = signature
+
+            while self._post_buffer:
+                post = self._post_buffer.popleft()
+                url = post.get("url")
+                if not url or url in self.config.image_history:
+                    continue
+                if len(self._post_buffer) < self.BUFFER_LOW_MARK:
+                    self._trigger_refill(normalized_pool)
+                self.config.image_history.append(url)
+                if len(self.config.image_history) > self.config.max_history:
+                    self.config.image_history.pop(0)
+                return post
+
+        # Empty buffer fallback: fetch synchronously once.
+        self._fetch_posts_into_buffer(normalized_pool)
+
+        with self._buffer_lock:
+            while self._post_buffer:
+                post = self._post_buffer.popleft()
+                url = post.get("url")
+                if not url or url in self.config.image_history:
+                    continue
+                self.config.image_history.append(url)
+                if len(self.config.image_history) > self.config.max_history:
+                    self.config.image_history.pop(0)
+                return post
+
+        return None
+
+    def fetch_images(self, tags: str, limit: int = 10) -> List[Dict]:
+        """Fetch images for given tags (endpoint helper)."""
+        query_tag = tags.strip() if tags and tags.strip() else "rating:explicit"
+        target_limit = max(1, int(limit))
+
+        results = self._fetch_one_tag(query_tag, limit=min(max(target_limit * 8, 20), 100))
+        random.shuffle(results)
+
+        deduped = []
+        seen_urls = set()
+        for item in results:
+            url = item.get("url")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            deduped.append(item)
+            if len(deduped) >= target_limit:
+                break
+
+        if not deduped:
+            log_info(f"ImageBot: no images found for tags='{query_tag}'")
+
+        return deduped
+
     def add_blacklist_tags(self, tags: str) -> int:
         """Add tags to blacklist."""
-        tag_list = [t.strip() for t in tags.split(',') if t.strip()]
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
         before = len(self.config.blacklist_tags)
         self.config.blacklist_tags.update(tag_list)
         added = len(self.config.blacklist_tags) - before
         self.save_blacklist()
         return added
-    
+
     def remove_blacklist_tags(self, tags: str) -> int:
         """Remove tags from blacklist."""
-        tag_list = [t.strip() for t in tags.split(',') if t.strip()]
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
         before = len(self.config.blacklist_tags)
         for tag in tag_list:
             self.config.blacklist_tags.discard(tag.lower())
         removed = before - len(self.config.blacklist_tags)
         self.save_blacklist()
         return removed
-    
+
     def get_blacklist(self) -> List[str]:
         """Get current blacklist."""
         return sorted(tag for tag in self.config.blacklist_tags if tag.strip())

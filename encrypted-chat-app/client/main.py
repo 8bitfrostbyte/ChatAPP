@@ -14,11 +14,12 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QListWidget, QListWidgetItem, QLineEdit, QPushButton,
-    QTextEdit, QLabel, QMessageBox, QDialog, QDialogButtonBox,
-    QComboBox, QFileDialog, QScrollArea, QInputDialog
+    QTextEdit, QTextBrowser, QLabel, QMessageBox, QDialog, QDialogButtonBox,
+    QComboBox, QFileDialog, QScrollArea, QInputDialog, QSplitter
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QIcon, QPixmap, QFont
+from PyQt6.QtGui import QDesktopServices
 
 import requests
 from websocket_client import WebSocketClient
@@ -226,6 +227,20 @@ class APIClient:
         except Exception as e:
             return False, str(e)
     
+    def clear_room_messages(self, room_id: int, count: int) -> tuple:
+        """Clear recent messages in a room."""
+        try:
+            response = requests.post(
+                f"{self.server_url}/api/rooms/{room_id}/clear",
+                params={"count": count},
+                headers=self._get_headers(),
+                timeout=10
+            )
+            if response.status_code == 200:
+                return True, response.json()
+            return False, response.json().get("detail", "Failed to clear messages")
+        except Exception as e:
+            return False, str(e)
     def upload_file(self, room_id: int, file_path: str) -> tuple:
         """Upload a file/image."""
         try:
@@ -496,6 +511,45 @@ class WebSocketThread(QThread):
             )
 
 
+class WorkerThread(QThread):
+    """Generic one-shot background worker. Runs fn(*args) and emits result."""
+    result = pyqtSignal(object)
+
+    def __init__(self, fn, *args):
+        super().__init__()
+        self._fn = fn
+        self._args = args
+
+    def run(self):
+        try:
+            self.result.emit(self._fn(*self._args))
+        except Exception as e:
+            self.result.emit(None)
+            print(f"WorkerThread error: {e}")
+
+
+class RoomRefreshThread(QThread):
+    """Background thread for polling the room list without blocking the UI."""
+
+    rooms_fetched = pyqtSignal(list)
+
+    def __init__(self, api_client: 'APIClient'):
+        super().__init__()
+        self.api_client = api_client
+        self._stop = False
+
+    def run(self):
+        while not self._stop:
+            success, rooms = self.api_client.list_rooms()
+            if success:
+                self.rooms_fetched.emit(rooms)
+            self.msleep(5000)
+
+    def stop(self):
+        self._stop = True
+        self.quit()
+
+
 class LoginDialog(QDialog):
     """Login/Register dialog."""
     
@@ -577,20 +631,49 @@ class ChatWindow(QMainWindow):
         self.current_room = None
         self.websocket_thread = None
         self.notification_handler = NotificationHandler(self)
+        self.sidebar_collapsed = False
         
         self.setWindowTitle("Encrypted Chat")
         self.setGeometry(100, 100, 1000, 600)
         
+        self.apply_dark_theme()
+
         # Main widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
         # Main layout
-        main_layout = QHBoxLayout()
+        main_layout = QVBoxLayout()
+
+        # Header row
+        header_layout = QHBoxLayout()
+        self.user_label = QLabel("User: not logged in")
+        self.user_label.setObjectName("HeaderUserLabel")
+        self.server_label = QLabel(f"Server: {self.server_url}")
+        self.server_label.setObjectName("HeaderServerLabel")
+        header_layout.addWidget(self.user_label)
+        header_layout.addStretch(1)
+        header_layout.addWidget(self.server_label)
+        main_layout.addLayout(header_layout)
+
+        # Content layout with resizable splitter
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         
         # Left sidebar - Rooms
+        self.sidebar_widget = QWidget()
         left_layout = QVBoxLayout()
-        left_layout.addWidget(QLabel("Rooms:"))
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        sidebar_header_layout = QHBoxLayout()
+        rooms_label = QLabel("Rooms")
+        rooms_label.setObjectName("SectionLabel")
+        self.toggle_sidebar_btn = QPushButton("Collapse")
+        self.toggle_sidebar_btn.setObjectName("SidebarToggleBtn")
+        self.toggle_sidebar_btn.clicked.connect(self.toggle_sidebar)
+        sidebar_header_layout.addWidget(rooms_label)
+        sidebar_header_layout.addStretch(1)
+        sidebar_header_layout.addWidget(self.toggle_sidebar_btn)
+        left_layout.addLayout(sidebar_header_layout)
         
         self.room_list = QListWidget()
         self.room_list.itemClicked.connect(self.on_room_selected)
@@ -607,23 +690,30 @@ class ChatWindow(QMainWindow):
         left_layout.addWidget(join_room_btn)
         
         # Members list
-        left_layout.addWidget(QLabel("In Room:"))
+        members_label = QLabel("In Room")
+        members_label.setObjectName("SectionLabel")
+        left_layout.addWidget(members_label)
         self.members_list = QListWidget()
         self.members_list.setMaximumWidth(260)
         left_layout.addWidget(self.members_list)
-        
-        main_layout.addLayout(left_layout, 1)
+
+        self.sidebar_widget.setLayout(left_layout)
         
         # Right side - Chat
+        chat_widget = QWidget()
         right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(0, 0, 0, 0)
         
         # Room name
         self.room_name_label = QLabel("Select a room")
+        self.room_name_label.setObjectName("RoomTitleLabel")
         right_layout.addWidget(self.room_name_label)
         
         # Messages
-        self.message_display = QTextEdit()
+        self.message_display = QTextBrowser()
         self.message_display.setReadOnly(True)
+        self.message_display.setOpenExternalLinks(False)
+        self.message_display.anchorClicked.connect(self.open_message_link)
         right_layout.addWidget(self.message_display)
         
         # Message input
@@ -651,21 +741,147 @@ class ChatWindow(QMainWindow):
         button_layout.addWidget(logout_btn)
         
         right_layout.addLayout(button_layout)
-        
-        main_layout.addLayout(right_layout, 2)
+
+        chat_widget.setLayout(right_layout)
+
+        self.main_splitter.addWidget(self.sidebar_widget)
+        self.main_splitter.addWidget(chat_widget)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([280, 720])
+
+        main_layout.addWidget(self.main_splitter)
         central_widget.setLayout(main_layout)
         
-        # Refresh rooms timer
-        self.refresh_timer = QTimer()
-        self.refresh_timer.timeout.connect(self.refresh_rooms)
-        self.refresh_timer.start(5000)  # Refresh every 5 seconds
+        # Prevent WorkerThread instances from being garbage-collected mid-run
+        self._workers = []
+
+        # Refresh rooms in a background thread so the UI never blocks
+        self.room_refresh_thread = RoomRefreshThread(self.api_client)
+        self.room_refresh_thread.rooms_fetched.connect(self._update_room_list)
+        self.room_refresh_thread.start()
     
-    def show_login(self):
-        """Show login dialog."""
+    def show_login(self) -> bool:
+        """Show login dialog. Returns True only on successful login."""
         dialog = LoginDialog(self.api_client, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.user_label.setText(f"User: {self.api_client.username}")
+            self.setWindowTitle(f"Encrypted Chat - {self.api_client.username}")
             self.refresh_rooms()
             self.auto_join_default_room()
+            return True
+        return False
+
+    def apply_dark_theme(self):
+        """Apply a custom dark theme for the app."""
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget {
+                background-color: #141a24;
+                color: #e8edf5;
+            }
+            QLabel#HeaderUserLabel, QLabel#HeaderServerLabel {
+                color: #8fa7c7;
+                font-size: 11px;
+            }
+            QLabel#SectionLabel {
+                color: #d6e1f2;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QLabel#RoomTitleLabel {
+                color: #f2f6ff;
+                font-size: 16px;
+                font-weight: 700;
+                padding: 4px 2px;
+            }
+            QListWidget, QTextEdit, QLineEdit {
+                background-color: #1d2533;
+                border: 1px solid #2f3d54;
+                border-radius: 8px;
+                padding: 6px;
+                color: #e8edf5;
+                selection-background-color: #2f4f7a;
+            }
+            QPushButton {
+                background-color: #244063;
+                border: 1px solid #33547c;
+                border-radius: 8px;
+                padding: 7px 10px;
+                color: #edf3ff;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #2d4f78;
+            }
+            QPushButton:pressed {
+                background-color: #1f3b5b;
+            }
+            QPushButton#SidebarToggleBtn {
+                min-width: 88px;
+            }
+            QSplitter::handle {
+                background-color: #2f3d54;
+                width: 3px;
+            }
+            QScrollBar:vertical {
+                background: #18202d;
+                width: 10px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: #2f4f7a;
+                border-radius: 5px;
+            }
+            """
+        )
+
+    def toggle_sidebar(self):
+        """Collapse/expand the left sidebar."""
+        self.sidebar_collapsed = not self.sidebar_collapsed
+        self.sidebar_widget.setVisible(not self.sidebar_collapsed)
+        self.toggle_sidebar_btn.setText("Expand" if self.sidebar_collapsed else "Collapse")
+
+    def format_message_html(self, username: str, content: str, msg_type: str = "text") -> str:
+        """Render a styled chat line with timestamp and role-specific colors."""
+        timestamp = datetime.now().strftime("%H:%M")
+        safe_content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        if "http://" in safe_content or "https://" in safe_content:
+            for token in safe_content.split():
+                if token.startswith("http://") or token.startswith("https://"):
+                    safe_content = safe_content.replace(
+                        token,
+                        f'<a href="{token}" style="color:#7fb4ff;text-decoration:none;">{token}</a>'
+                    )
+
+        if msg_type == "system":
+            return (
+                f'<div style="margin:2px 0;color:#9aa8ba;font-style:italic;">'
+                f'[{timestamp}] [SYSTEM] {safe_content}</div>'
+            )
+
+        is_self = username == self.api_client.username
+        align = "right" if is_self else "left"
+        bubble = "#2d5f57" if is_self else "#273349"
+        name_color = "#8df2d4" if is_self else "#9bc3ff"
+
+        return (
+            f'<div style="text-align:{align};margin:4px 0;">'
+            f'<span style="color:#8da0b9;font-size:11px;">[{timestamp}] </span>'
+            f'<span style="color:{name_color};font-weight:700;">{username}</span><br>'
+            f'<span style="display:inline-block;background:{bubble};padding:6px 10px;border-radius:10px;">'
+            f'{safe_content}</span>'
+            f'</div>'
+        )
+
+    def append_chat_message(self, username: str, content: str, msg_type: str = "text"):
+        """Append one formatted message to the chat display."""
+        self.message_display.append(self.format_message_html(username, content, msg_type))
+
+    def open_message_link(self, url: QUrl):
+        """Open links clicked inside the chat display in the default browser."""
+        QDesktopServices.openUrl(url)
 
     def auto_join_default_room(self):
         """Automatically join the default chat room after login."""
@@ -686,63 +902,85 @@ class ChatWindow(QMainWindow):
             self.room_list.setCurrentItem(target_item)
             self.on_room_selected(target_item)
     
+    def _run_in_bg(self, fn, callback, *args):
+        """Run fn(*args) in a background thread, call callback(result) on the main thread."""
+        worker = WorkerThread(fn, *args)
+        worker.result.connect(callback)
+        worker.finished.connect(lambda: self._workers.remove(worker) if worker in self._workers else None)
+        self._workers.append(worker)
+        worker.start()
+
     def refresh_rooms(self):
-        """Refresh list of available rooms."""
-        success, rooms = self.api_client.list_rooms()
-        if success:
-            self.room_list.clear()
-            for room in rooms:
-                item = QListWidgetItem(room["name"])
-                item.setData(Qt.ItemDataRole.UserRole, room["id"])
-                self.room_list.addItem(item)
+        """Refresh list of available rooms (immediate, called after user actions)."""
+        def _apply(result):
+            if result and result[0]:
+                self._update_room_list(result[1])
+        self._run_in_bg(self.api_client.list_rooms, _apply)
+
+    def _update_room_list(self, rooms: list):
+        """Update the room list widget (safe to call from any thread via signal)."""
+        self.room_list.clear()
+        for room in rooms:
+            item = QListWidgetItem(room["name"])
+            item.setData(Qt.ItemDataRole.UserRole, room["id"])
+            self.room_list.addItem(item)
     
     def on_room_selected(self, item):
-        """Handle room selection."""
+        """Handle room selection — all network calls run in background."""
         room_id = item.data(Qt.ItemDataRole.UserRole)
         room_name = item.text()
-        
+
         self.current_room = room_id
         self.room_name_label.setText(f"Room: {room_name}")
-        
-        # Join room
-        success, _ = self.api_client.join_room(room_id)
-        if success:
-            # Disconnect from previous WebSocket if any
-            if self.websocket_thread:
-                self.websocket_thread.stop()
-                self.websocket_thread.wait()
-            
-            # Load message history
-            self.load_messages()
-            
-            # Connect WebSocket
+        self.message_display.clear()
+        self.members_list.clear()
+
+        # Stop previous WebSocket immediately (no blocking wait)
+        if self.websocket_thread:
+            self.websocket_thread.stop()
+            self.websocket_thread = None
+
+        def _fetch(rid):
+            ok_join, _ = self.api_client.join_room(rid)
+            if not ok_join:
+                return None
+            ok_msgs, messages = self.api_client.get_messages(rid, limit=50)
+            ok_mbrs, members = self.api_client.get_room_members(rid)
+            return {
+                "messages": messages if ok_msgs else [],
+                "members": members if ok_mbrs else [],
+            }
+
+        def _apply(result):
+            if result is None:
+                QMessageBox.warning(self, "Error", "Failed to join room")
+                return
+            self.message_display.clear()
+            for msg in result["messages"]:
+                username = msg.get("username", "Unknown")
+                content = msg.get("content", "")
+                msg_type = msg.get("message_type", "text")
+                self.append_chat_message(username, content, msg_type)
+            self._update_members(result["members"])
             self.connect_websocket()
-            
-            # Load members
-            self.refresh_members()
-        else:
-            QMessageBox.warning(self, "Error", "Failed to join room")
-    
+
+        self._run_in_bg(_fetch, _apply, room_id)
+
     def load_messages(self):
-        """Load message history for current room."""
+        """Reload message history for current room in background."""
         if not self.current_room:
             return
-        
-        self.message_display.clear()
-        success, messages = self.api_client.get_messages(self.current_room, limit=50)
-        if success:
+        def _fetch(rid):
+            ok, msgs = self.api_client.get_messages(rid, limit=50)
+            return msgs if ok else []
+        def _apply(messages):
+            self.message_display.clear()
             for msg in messages:
                 username = msg.get("username", "Unknown")
                 content = msg.get("content", "")
-                timestamp = msg.get("created_at", "")
                 msg_type = msg.get("message_type", "text")
-                
-                if msg_type == "system":
-                    display = f"[SYSTEM] {content}"
-                else:
-                    display = f"[{username}] {content}"
-                
-                self.message_display.append(display)
+                self.append_chat_message(username, content, msg_type)
+        self._run_in_bg(_fetch, _apply, self.current_room)
     
     def send_message(self):
         """Send a message."""
@@ -782,7 +1020,7 @@ class ChatWindow(QMainWindow):
 
     def append_system_message(self, text: str):
         """Append a local system message to the chat window."""
-        self.message_display.append(f"[SYSTEM] {text}")
+        self.append_chat_message("SYSTEM", text, "system")
 
     def show_room_commands(self):
         """Display all room commands."""
@@ -792,6 +1030,7 @@ class ChatWindow(QMainWindow):
             "!createroom <name> [private] - Create a new room",
             "!removeroom <name|id> - Delete a room (creator-only)",
             "!makeprivate - Make current room private (creator-only)",
+            "!clear <count> - Clear recent messages (creator clears room, others clear own)",
             "/room list - List available rooms",
             "/room create <name> [private] - Create a new room",
             "/room delete <name|id> - Delete a room",
@@ -822,7 +1061,7 @@ class ChatWindow(QMainWindow):
         """Handle !bot and Discord-like ! commands typed in chat input."""
         cmd = raw_command.strip()
 
-        if cmd.startswith("!"):
+        if cmd.startswith("!") and not cmd.lower().startswith("!bot"):
             bang_parts = cmd[1:].split(maxsplit=2)
             if not bang_parts:
                 self.append_system_message("Unknown bot command. Use !help")
@@ -840,38 +1079,31 @@ class ChatWindow(QMainWindow):
                 )
                 return
 
-            if bang_action == "start":
-                self.handle_bot_command(f"!bot start {bang_rest}".strip())
-                return
-            if bang_action == "stop":
-                self.handle_bot_command("!bot stop")
-                return
-            if bang_action == "pause":
-                self.handle_bot_command("!bot pause")
-                return
-            if bang_action == "resume":
-                self.handle_bot_command("!bot resume")
-                return
-            if bang_action == "status":
-                self.handle_bot_command("!bot status")
-                return
-            if bang_action == "commands":
-                self.handle_bot_command("!bot commands")
-                return
-            if bang_action == "addtags":
-                self.handle_bot_command(f"!bot tags add {bang_rest}".strip())
-                return
-            if bang_action == "removetags":
-                self.handle_bot_command(f"!bot tags remove {bang_rest}".strip())
-                return
-            if bang_action == "taglist":
-                self.handle_bot_command("!bot tags list")
-                return
-            if bang_action == "cleartags":
-                self.handle_bot_command("!bot tags clear")
+            shorthand_map = {
+                "start":      lambda: self.handle_bot_command(f"!bot start {bang_rest}".strip()),
+                "stop":       lambda: self.handle_bot_command("!bot stop"),
+                "pause":      lambda: self.handle_bot_command("!bot pause"),
+                "resume":     lambda: self.handle_bot_command("!bot resume"),
+                "status":     lambda: self.handle_bot_command("!bot status"),
+                "commands":   lambda: self.handle_bot_command("!bot commands"),
+                "addtags":    lambda: self.handle_bot_command(f"!bot tags add {bang_rest}".strip()),
+                "removetags": lambda: self.handle_bot_command(f"!bot tags remove {bang_rest}".strip()),
+                "taglist":    lambda: self.handle_bot_command("!bot tags list"),
+                "cleartags":  lambda: self.handle_bot_command("!bot tags clear"),
+                "search":     lambda: self.handle_bot_command(f"!bot search {bang_rest}".strip()),
+                "image":      lambda: self.handle_bot_command(f"!bot image {bang_rest}".strip()),
+                "blacklist":  lambda: self.handle_bot_command(f"!bot blacklist {bang_rest}".strip()),
+                "tags":       lambda: self.handle_bot_command(f"!bot tags {bang_rest}".strip()),
+            }
+
+            if bang_action in shorthand_map:
+                shorthand_map[bang_action]()
                 return
 
-            self.append_system_message("Unknown bot command. Use !help")
+            self.append_system_message(
+                "Unknown command. Available: !start !stop !pause !resume !status "
+                "!search !image !addtags !removetags !taglist !cleartags !blacklist"
+            )
             return
 
         parts = cmd.split(maxsplit=2)
@@ -1057,15 +1289,19 @@ class ChatWindow(QMainWindow):
                 return
 
             image_url = images[0].get("url")
+            image_tags = images[0].get("tags", "")
             if not image_url:
                 self.append_system_message("Bot returned an image without URL.")
                 return
 
+            pretty_tags = image_tags if image_tags else "(no tags)"
+            payload = f"Tags: {pretty_tags}\n{image_url}"
+
             if self.websocket_thread and self.websocket_thread.client:
-                self.websocket_thread.send_message(f"[BOT IMAGE] {image_url}")
+                self.websocket_thread.send_message(payload)
                 self.append_system_message("Bot image sent to room.")
             else:
-                self.append_system_message(f"Bot image URL: {image_url}")
+                self.append_system_message(payload)
             return
 
         if action == "blacklist":
@@ -1291,50 +1527,47 @@ class ChatWindow(QMainWindow):
         username = data.get("username", "Unknown")
         content = data.get("content", "")
         msg_type = data.get("message_type", "text")
-        
+
         if msg_type == "image":
-            display = f"[{username}] [Image] {data.get('file_url', '')}"
-        else:
-            display = f"[{username}] {content}"
+            content = f"[Image] {data.get('file_url', '')}"
+
+        self.append_chat_message(username, content, msg_type)
         
-        self.message_display.append(display)
-        
-        # Notification
-        self.notification_handler.notify_message_received(username, content[:50])
+        # Only notify (sound) for messages from other users
+        if username != self.api_client.username:
+            self.notification_handler.notify_message_received(username, content[:50])
     
     def on_user_joined(self, data: dict):
         """Handle user joined."""
         username = data.get("username", "Unknown")
         message = data.get("message", f"{username} joined")
-        
-        self.message_display.append(f"[SYSTEM] {message}")
+
+        self.append_chat_message("SYSTEM", message, "system")
         self.notification_handler.notify_user_joined(username)
         self.refresh_members()
     
     def on_user_left(self, data: dict):
-        """Handle user left."""
-        username = data.get("username", "Unknown")
-        message = data.get("message", f"{username} left")
-        
-        self.message_display.append(f"[SYSTEM] {message}")
-        self.notification_handler.notify_user_left(username)
+        """Handle user left — update members list only; offline message comes from server."""
         self.refresh_members()
     
     def on_typing(self, data: dict):
         """Handle typing indicator."""
         pass  # Could show "User is typing..."
     
+    def _update_members(self, members: list):
+        """Update the members list widget (must be called on main thread)."""
+        self.members_list.clear()
+        for member in members:
+            self.members_list.addItem(QListWidgetItem(member["username"]))
+
     def refresh_members(self):
-        """Refresh room members list."""
+        """Refresh room members list in background."""
         if not self.current_room:
             return
-        
-        self.members_list.clear()
-        success, members = self.api_client.get_room_members(self.current_room)
-        if success:
-            for member in members:
-                item = QListWidgetItem(member["username"])
-                self.members_list.addItem(item)
+        def _fetch(rid):
+            ok, mbrs = self.api_client.get_room_members(rid)
+            return mbrs if ok else []
+        self._run_in_bg(_fetch, self._update_members, self.current_room)
     
     def create_room(self):
         """Create a new room."""
@@ -1383,7 +1616,7 @@ class ChatWindow(QMainWindow):
             self.api_client.leave_room(self.current_room)
         if self.websocket_thread:
             self.websocket_thread.stop()
-        self.refresh_timer.stop()
+        self.room_refresh_thread.stop()
         super().closeEvent(event)
 
 
@@ -1394,7 +1627,8 @@ class ChatApp(QApplication):
         super().__init__(argv)
         
         self.window = ChatWindow(server_url)
-        self.window.show_login()
+        if not self.window.show_login():
+            sys.exit(0)
         self.window.show()
 
 
