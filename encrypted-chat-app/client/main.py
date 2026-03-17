@@ -1256,7 +1256,10 @@ class ChatWindow(QMainWindow):
                     updater_bat.write_text(script, encoding="utf-8")
                     self.append_system_message(f"Update v{latest} downloaded. Restarting to apply update...")
                     subprocess.Popen(["cmd", "/c", str(updater_bat)], creationflags=0x08000000)
+                    # Use a hard-exit fallback so the updater script is never blocked waiting on this process.
                     QTimer.singleShot(300, self.close)
+                    QTimer.singleShot(450, lambda: QApplication.instance().quit())
+                    QTimer.singleShot(4000, lambda: os._exit(0))
                     if done_callback:
                         done_callback(True, payload)
                 except Exception as e:
