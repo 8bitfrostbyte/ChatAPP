@@ -26,6 +26,7 @@ class WebSocketClient:
         self.on_message_deleted_callback: Optional[Callable] = None
         self.loop = None
         self.receive_task = None
+        self.heartbeat_task = None
     
     def set_on_message(self, callback: Callable):
         """Set callback for when a message is received."""
@@ -60,6 +61,8 @@ class WebSocketClient:
             
             # Start receiving messages
             self.receive_task = asyncio.create_task(self._receive_loop())
+            # Keep presence fresh so online member list is accurate.
+            self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         
         except Exception as e:
             print(f"WebSocket connection error: {e}")
@@ -83,6 +86,21 @@ class WebSocketClient:
         except Exception as e:
             print(f"WebSocket receive error: {e}")
             self.is_connected = False
+
+    async def _heartbeat_loop(self):
+        """Send periodic heartbeat packets while connected."""
+        try:
+            while self.is_connected and self.websocket:
+                await asyncio.sleep(15)
+                if not self.is_connected or not self.websocket:
+                    break
+                await self.websocket.send(json.dumps({
+                    "type": "heartbeat",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }))
+        except Exception:
+            # Heartbeat failure will naturally be handled by receive loop/disconnect path.
+            pass
     
     async def _handle_message(self, data: dict):
         """Handle incoming message based on type."""
@@ -142,6 +160,11 @@ class WebSocketClient:
     async def disconnect(self):
         """Disconnect from the WebSocket server."""
         if self.websocket:
+            if self.heartbeat_task:
+                self.heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.heartbeat_task
+                self.heartbeat_task = None
             if self.receive_task:
                 self.receive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

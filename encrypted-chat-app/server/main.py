@@ -14,6 +14,7 @@ import shutil
 import random
 import mimetypes
 import re
+import time
 from pathlib import Path
 from contextlib import suppress
 import requests
@@ -55,18 +56,55 @@ UPDATE_CACHE_DIR.mkdir(exist_ok=True)
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[int, List[WebSocket]] = {}
+        # room_id -> {user_id -> connection_count}
+        self.room_user_connections: Dict[int, Dict[int, int]] = {}
+        # room_id -> {user_id -> unix timestamp}
+        self.room_user_last_seen: Dict[int, Dict[int, float]] = {}
     
-    async def connect(self, websocket: WebSocket, room_id: int):
+    async def connect(self, websocket: WebSocket, room_id: int, user_id: int):
         await websocket.accept()
         if room_id not in self.active_connections:
             self.active_connections[room_id] = []
         self.active_connections[room_id].append(websocket)
+        if room_id not in self.room_user_connections:
+            self.room_user_connections[room_id] = {}
+        self.room_user_connections[room_id][user_id] = self.room_user_connections[room_id].get(user_id, 0) + 1
+        self.touch(room_id, user_id)
     
-    def disconnect(self, websocket: WebSocket, room_id: int):
+    def disconnect(self, websocket: WebSocket, room_id: int, user_id: int):
         if room_id in self.active_connections:
-            self.active_connections[room_id].remove(websocket)
+            if websocket in self.active_connections[room_id]:
+                self.active_connections[room_id].remove(websocket)
             if not self.active_connections[room_id]:
                 del self.active_connections[room_id]
+
+        if room_id in self.room_user_connections:
+            current = self.room_user_connections[room_id].get(user_id, 0)
+            if current <= 1:
+                self.room_user_connections[room_id].pop(user_id, None)
+            else:
+                self.room_user_connections[room_id][user_id] = current - 1
+            if not self.room_user_connections[room_id]:
+                del self.room_user_connections[room_id]
+
+        if room_id in self.room_user_last_seen:
+            self.room_user_last_seen[room_id].pop(user_id, None)
+            if not self.room_user_last_seen[room_id]:
+                del self.room_user_last_seen[room_id]
+
+    def touch(self, room_id: int, user_id: int):
+        if room_id not in self.room_user_last_seen:
+            self.room_user_last_seen[room_id] = {}
+        self.room_user_last_seen[room_id][user_id] = time.time()
+
+    def list_online_user_ids(self, room_id: int, max_age_seconds: int = 60) -> List[int]:
+        now = time.time()
+        last_seen = self.room_user_last_seen.get(room_id) or {}
+        return [
+            user_id
+            for user_id, seen_at in last_seen.items()
+            if (now - float(seen_at)) <= float(max_age_seconds)
+        ]
     
     async def broadcast(self, room_id: int, message: dict):
         if room_id in self.active_connections:
@@ -954,7 +992,14 @@ async def get_room_members(
         if not is_member:
             raise HTTPException(status_code=403, detail="Private room")
 
-    members = db.query(RoomMember).filter(RoomMember.room_id == room_id).all()
+    online_user_ids = manager.list_online_user_ids(room_id, max_age_seconds=60)
+    if not online_user_ids:
+        return []
+
+    members = db.query(RoomMember).filter(
+        RoomMember.room_id == room_id,
+        RoomMember.user_id.in_(online_user_ids)
+    ).all()
     return [{"id": m.user.id, "username": m.user.username, "joined_at": m.joined_at} for m in members]
 
 
@@ -1486,11 +1531,15 @@ async def websocket_endpoint(room_id: int, token: str, websocket: WebSocket):
         await websocket.close(code=4003, reason="Not a member of this room")
         return
     
-    await manager.connect(websocket, room_id)
+    await manager.connect(websocket, room_id, user.id)
     
     try:
         while True:
             data = await websocket.receive_json()
+            manager.touch(room_id, user.id)
+
+            if data.get("type") == "heartbeat":
+                continue
             
             if data.get("type") == "message":
                 # Encrypt and store message
@@ -1526,7 +1575,7 @@ async def websocket_endpoint(room_id: int, token: str, websocket: WebSocket):
         print(f"WebSocket error: {e}")
     
     finally:
-        manager.disconnect(websocket, room_id)
+        manager.disconnect(websocket, room_id, user.id)
         db.close()
 
 
