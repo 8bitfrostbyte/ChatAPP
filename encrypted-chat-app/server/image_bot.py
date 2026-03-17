@@ -42,6 +42,14 @@ class ImageBotConfig:
         self.start_tags = set()
         self.image_history = []
         self.max_history = 200
+        # Helpful startup signal to verify systemd env propagation without exposing secrets.
+        log_info(
+            "ImageBot credentials loaded: "
+            f"danbooru_user={'yes' if bool(self.danbooru_username) else 'no'}, "
+            f"danbooru_key={'yes' if bool(self.danbooru_api_key) else 'no'}, "
+            f"rule34_user={'yes' if bool(self.rule34_user_id) else 'no'}, "
+            f"rule34_key={'yes' if bool(self.rule34_api_key) else 'no'}"
+        )
 
 
 class ImageBot:
@@ -245,7 +253,7 @@ class ImageBot:
         if cleaned:
             return [t.replace("+", " ") for t in cleaned if t.strip()]
 
-        return ["rating:explicit"]
+        return list(self.RANDOM_FALLBACK_TAGS)
 
     def get_matching_blacklist_tags(self, tags) -> List[str]:
         """Get blacklist tags that match the given tags."""
@@ -537,6 +545,17 @@ class ImageBot:
         rule34_tags = self._search_rule34_tags(normalized, limit=limit)
         danbooru_tags = self._search_danbooru_tags(normalized, limit=limit)
 
+        # Reliability fallback for server environments where post endpoints are sparse/rate-limited.
+        if len(rule34_tags) < 3:
+            wildcard_rule34 = self._search_rule34_wildcard_tags(normalized, limit=limit)
+            for name, count in wildcard_rule34.items():
+                rule34_tags[name] = max(rule34_tags.get(name, 0), count)
+
+        if len(danbooru_tags) < 3:
+            direct_danbooru = self._search_danbooru_tag_directory(normalized, limit=max(limit, 80))
+            for name, count in direct_danbooru.items():
+                danbooru_tags[name] = max(danbooru_tags.get(name, 0), count)
+
         sample_sorted = sorted(
             set(rule34_tags.keys()) | set(danbooru_tags.keys()),
             key=lambda name: (-(rule34_tags.get(name, 0) + danbooru_tags.get(name, 0)), name),
@@ -692,6 +711,16 @@ class ImageBot:
                     except Exception:
                         continue
 
+            # Emergency probe fallback when normal tag fetches return empty.
+            if not new_posts:
+                for emergency_tag in ["", "1girl", "solo", "original"]:
+                    try:
+                        new_posts.extend(self._fetch_one_tag(emergency_tag, 80))
+                    except Exception:
+                        continue
+                    if len(new_posts) >= 20:
+                        break
+
             if new_posts:
                 random.shuffle(new_posts)
                 with self._buffer_lock:
@@ -699,6 +728,8 @@ class ImageBot:
                 log_verbose(
                     f"Buffer refilled: {len(new_posts)} posts from {len(tags)} tag(s) (total: {len(self._post_buffer)})"
                 )
+            else:
+                log_info("ImageBot: buffer refill returned zero posts (including emergency probes)")
         finally:
             self._refill_in_progress = False
 
@@ -751,6 +782,20 @@ class ImageBot:
                 if len(self.config.image_history) > self.config.max_history:
                     self.config.image_history.pop(0)
                 return post
+
+        # Final retry with default random pool if a custom pool yielded nothing.
+        if normalized_pool:
+            self._fetch_posts_into_buffer([])
+            with self._buffer_lock:
+                while self._post_buffer:
+                    post = self._post_buffer.popleft()
+                    url = post.get("url")
+                    if not url or url in self.config.image_history:
+                        continue
+                    self.config.image_history.append(url)
+                    if len(self.config.image_history) > self.config.max_history:
+                        self.config.image_history.pop(0)
+                    return post
 
         return None
 
