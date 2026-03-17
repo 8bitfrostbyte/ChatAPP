@@ -100,11 +100,15 @@ class ConnectionManager:
     def list_online_user_ids(self, room_id: int, max_age_seconds: int = 60) -> List[int]:
         now = time.time()
         last_seen = self.room_user_last_seen.get(room_id) or {}
-        return [
+        fresh_ids = {
             user_id
             for user_id, seen_at in last_seen.items()
             if (now - float(seen_at)) <= float(max_age_seconds)
-        ]
+        }
+        # Backward compatibility: older clients may not send heartbeat yet,
+        # but they still hold active websocket connections.
+        connected_ids = set((self.room_user_connections.get(room_id) or {}).keys())
+        return list(fresh_ids | connected_ids)
     
     async def broadcast(self, room_id: int, message: dict):
         if room_id in self.active_connections:

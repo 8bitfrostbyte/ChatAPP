@@ -44,13 +44,6 @@ jobs:
         shell: pwsh
         run: |
           Set-Content -Path "encrypted-chat-app/client/version.txt" -Value "${{ steps.tag.outputs.version }}" -Encoding UTF8
-          $mainPath = "encrypted-chat-app/client/main.py"
-          $content = Get-Content -Path $mainPath -Raw -Encoding UTF8
-          $updated = $content -replace 'CLIENT_VERSION\s*=\s*"[^"]+"', 'CLIENT_VERSION = "${{ steps.tag.outputs.version }}"'
-          if ($updated -eq $content) {
-            throw "Failed to update CLIENT_VERSION in $mainPath"
-          }
-          Set-Content -Path $mainPath -Value $updated -Encoding UTF8
 
       - name: Setup Python
         uses: actions/setup-python@v5
