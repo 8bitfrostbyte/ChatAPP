@@ -28,6 +28,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $clientDir = Join-Path $root "client"
 $specPath = Join-Path $clientDir "EncryptedChat.spec"
 $mainPy = Join-Path $clientDir "main.py"
+$versionFile = Join-Path $clientDir "version.txt"
 $distExe = Join-Path $clientDir "dist\EncryptedChat.exe"
 
 if (-not (Test-Path $specPath)) {
@@ -59,6 +60,8 @@ Invoke-Step -Name "Check GitHub auth" -Action {
 }
 
 Invoke-Step -Name "Build EncryptedChat.exe" -Action {
+    Set-Content -Path $versionFile -Value $releaseVersion -Encoding UTF8
+
     $mainContent = Get-Content -Path $mainPy -Raw -Encoding UTF8
     $updatedMain = [regex]::Replace($mainContent, 'CLIENT_VERSION\s*=\s*"[^"]+"', "CLIENT_VERSION = \"$releaseVersion\"")
     if ($updatedMain -eq $mainContent) {

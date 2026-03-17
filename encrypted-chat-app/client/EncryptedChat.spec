@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('version.txt', '.')],
     hiddenimports=['requests', 'requests.adapters', 'requests.auth', 'urllib3', 'cryptography', 'aiohttp', 'websockets', 'socketio', 'pydantic', 'PIL'],
     hookspath=[],
     hooksconfig={},

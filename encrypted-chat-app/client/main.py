@@ -37,7 +37,24 @@ from PyQt6.QtGui import QDesktopServices
 from websocket_client import WebSocketClient
 from notification_handler import NotificationHandler
 
-CLIENT_VERSION = "1.0.0"
+def _load_client_version(default: str = "1.0.0") -> str:
+    """Load client version from packaged version.txt when available."""
+    try:
+        if getattr(sys, "frozen", False):
+            base_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        else:
+            base_dir = Path(__file__).resolve().parent
+        version_path = base_dir / "version.txt"
+        if version_path.exists():
+            value = version_path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+    except Exception:
+        pass
+    return default
+
+
+CLIENT_VERSION = _load_client_version("1.0.0")
 
 # ---------------------------------------------------------------------------
 # Theme system
