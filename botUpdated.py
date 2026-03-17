@@ -30,7 +30,7 @@ config = {
     "start_tags": set(),
     "blacklist_tags": set(),
     # Fill these in with your Danbooru credentials if you want to use Danbooru
-    "danbooru_username": "FrostBytte",
+    "danbooru_username": "Frost",
     "danbooru_api_key": "b9JmYZAm6a1GMfKdWDNzoFSY",
     # Fill these in with your Rule34 credentials if you want to use Rule34
     "rule34_user_id": "5901111",

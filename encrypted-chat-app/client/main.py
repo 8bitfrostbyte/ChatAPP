@@ -489,6 +489,19 @@ class APIClient:
         except Exception as e:
             return False, str(e)
 
+    def clear_bot_blacklist(self) -> tuple:
+        """Clear all bot blacklist tags."""
+        try:
+            response = requests.post(
+                f"{self.server_url}/api/bot/blacklist/clear",
+                timeout=10
+            )
+            if response.status_code == 200:
+                return True, response.json()
+            return False, response.json().get("detail", "Failed to clear blacklist tags")
+        except Exception as e:
+            return False, str(e)
+
     def start_bot_stream(self, room_id: int, interval: float, tags: Optional[str] = None) -> tuple:
         """Start room bot image stream."""
         try:
@@ -1786,7 +1799,7 @@ class ChatWindow(QMainWindow):
             "!bot search <tags> - Search for images",
             "!searchtags <query> - Detailed tag search (botUpdated-style)",
             "!bot image <tags> - Fetch single image",
-            "!bot blacklist show|add|remove - Manage blacklist"
+            "!bot blacklist show|add|remove|clear - Manage blacklist"
         ]
         self.append_system_message(" | ".join(commands))
 
@@ -1822,7 +1835,8 @@ class ChatWindow(QMainWindow):
             if bang_action == "help":
                 self.append_system_message(
                     "Discord-style commands: !start <seconds> [tags] | !pause | !resume | !stop | !status | !commands | "
-                    "!addtags <tag1,tag2> | !removetags <tag1,tag2|count> | !taglist | !cleartags | !saveimages [folder_path]"
+                    "!addtags <tag1,tag2> | !removetags <tag1,tag2|count> | !taglist | !cleartags | "
+                    "!blacklist [list|add <tags>|remove <tags>|clear] | !saveimages [folder_path]"
                 )
                 return
 
@@ -1863,7 +1877,7 @@ class ChatWindow(QMainWindow):
                 "Bot commands: !bot start <seconds> [tags] | !bot pause | !bot resume | !bot stop | !bot status | !bot commands | "
                 "!bot search <query> | !bot searchtags <query> | !bot image <tags> | "
                 "!bot tags list|add <tags>|remove <tags>|clear | "
-                "!bot blacklist show | !bot blacklist add <tag1,tag2> | !bot blacklist remove <tag1,tag2>"
+                "!bot blacklist show | !bot blacklist add <tag1,tag2> | !bot blacklist remove <tag1,tag2> | !bot blacklist clear"
             )
             return
 
@@ -2039,7 +2053,7 @@ class ChatWindow(QMainWindow):
             self.append_system_message("Usage: !bot tags list|add <tags>|remove <tags>|clear")
             return
 
-        if not arg and action in {"search", "searchtags", "image", "blacklist"}:
+        if not arg and action in {"search", "searchtags", "image"}:
             self.append_system_message("Invalid bot command. Use !bot help")
             return
 
@@ -2118,10 +2132,10 @@ class ChatWindow(QMainWindow):
 
         if action == "blacklist":
             bl_parts = arg.split(maxsplit=1)
-            bl_action = bl_parts[0].lower()
+            bl_action = bl_parts[0].lower() if bl_parts else "list"
             bl_tags = bl_parts[1].strip() if len(bl_parts) > 1 else ""
 
-            if bl_action == "show":
+            if bl_action in {"show", "list"}:
                 _run_bot_request(
                     self.api_client.get_bot_blacklist,
                     lambda result: self.append_system_message(
@@ -2153,7 +2167,17 @@ class ChatWindow(QMainWindow):
                 )
                 return
 
-            self.append_system_message("Usage: !bot blacklist show|add <tags>|remove <tags>")
+            if bl_action == "clear":
+                _run_bot_request(
+                    self.api_client.clear_bot_blacklist,
+                    lambda result: self.append_system_message(
+                        f"Cleared blacklist tags. Removed: {result.get('removed', 0)}"
+                    ),
+                    "Failed to clear blacklist tags",
+                )
+                return
+
+            self.append_system_message("Usage: !bot blacklist show|add <tags>|remove <tags>|clear")
             return
 
         self.append_system_message("Unknown bot command. Use !bot help")

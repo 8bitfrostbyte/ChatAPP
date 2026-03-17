@@ -130,7 +130,11 @@ class ImageBot:
             with open(blacklist_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
-                self.config.blacklist_tags = {str(tag).strip() for tag in data if str(tag).strip()}
+                self.config.blacklist_tags = {
+                    str(tag).strip().lower()
+                    for tag in data
+                    if str(tag).strip()
+                }
         except Exception as e:
             print(f"Failed to load blacklist: {e}")
 
@@ -862,7 +866,7 @@ class ImageBot:
 
     def add_blacklist_tags(self, tags: str) -> int:
         """Add tags to blacklist."""
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
         before = len(self.config.blacklist_tags)
         self.config.blacklist_tags.update(tag_list)
         added = len(self.config.blacklist_tags) - before
@@ -871,11 +875,18 @@ class ImageBot:
 
     def remove_blacklist_tags(self, tags: str) -> int:
         """Remove tags from blacklist."""
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
         before = len(self.config.blacklist_tags)
         for tag in tag_list:
-            self.config.blacklist_tags.discard(tag.lower())
+            self.config.blacklist_tags.discard(tag)
         removed = before - len(self.config.blacklist_tags)
+        self.save_blacklist()
+        return removed
+
+    def clear_blacklist_tags(self) -> int:
+        """Clear all blacklist tags."""
+        removed = len(self.config.blacklist_tags)
+        self.config.blacklist_tags.clear()
         self.save_blacklist()
         return removed
 

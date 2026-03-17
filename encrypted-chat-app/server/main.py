@@ -1049,6 +1049,13 @@ async def remove_blacklist(tags: str):
     return {"removed": removed, "blacklist": image_bot.get_blacklist()}
 
 
+@app.post("/api/bot/blacklist/clear")
+async def clear_blacklist():
+    """Clear all blacklist tags."""
+    removed = image_bot.clear_blacklist_tags()
+    return {"removed": removed, "blacklist": image_bot.get_blacklist()}
+
+
 @app.get("/api/bot/tags")
 async def get_saved_tags():
     """Get saved/start tags used by start command."""
