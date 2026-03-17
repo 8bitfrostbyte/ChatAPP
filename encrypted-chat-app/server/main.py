@@ -93,7 +93,13 @@ def _is_newer_version(latest: str, current: str) -> bool:
 
 def _extract_release_version(release_json: dict) -> str:
     tag = str(release_json.get("tag_name") or "").strip()
-    if tag.lower().startswith("v"):
+    # Strip common tag prefixes: "version_", "version", "v"
+    lower = tag.lower()
+    if lower.startswith("version_"):
+        tag = tag[8:]
+    elif lower.startswith("version"):
+        tag = tag[7:]
+    elif lower.startswith("v"):
         tag = tag[1:]
     return tag or "0.0.0"
 
@@ -1537,10 +1543,25 @@ async def health_check():
 @app.get("/api/update/check")
 async def check_for_update(current_version: str = Query("0.0.0")):
     """Check GitHub latest release from the server and report update availability."""
+    if not UPDATE_GITHUB_REPO or "/" not in UPDATE_GITHUB_REPO:
+        return {
+            "configured": False,
+            "update_available": False,
+            "current_version": current_version,
+            "latest_version": current_version,
+            "release_name": "",
+            "published_at": None,
+            "notes": "",
+            "asset_name": UPDATE_ASSET_NAME,
+            "repo": UPDATE_GITHUB_REPO,
+            "detail": "Update server is not configured",
+        }
+
     try:
         latest = _fetch_latest_release()
         latest_version = latest.get("version", "0.0.0")
         return {
+            "configured": True,
             "update_available": _is_newer_version(latest_version, current_version),
             "current_version": current_version,
             "latest_version": latest_version,

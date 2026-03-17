@@ -1185,6 +1185,13 @@ class ChatWindow(QMainWindow):
             success, payload = result if result else (False, "Update check failed")
             if success and isinstance(payload, dict):
                 self._pending_update_info = payload
+                if payload.get("configured") is False:
+                    if manual:
+                        self.append_system_message("Updates are not configured on this server yet.")
+                    if done_callback:
+                        done_callback(True, payload)
+                    return
+
                 latest = str(payload.get("latest_version", "")).strip()
                 if payload.get("update_available") and latest and latest != self._last_update_notice_version:
                     self._last_update_notice_version = latest
@@ -2878,6 +2885,10 @@ class ChatWindow(QMainWindow):
                 return
             if not isinstance(info, dict) or not info:
                 update_status_label.setText("Checking status: not checked yet")
+                return
+
+            if info.get("configured") is False:
+                update_status_label.setText("Updates are not configured on this server.")
                 return
 
             latest = str(info.get("latest_version", "unknown"))
