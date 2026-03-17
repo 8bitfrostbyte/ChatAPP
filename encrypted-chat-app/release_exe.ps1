@@ -27,10 +27,22 @@ if ([string]::IsNullOrWhiteSpace($Title)) {
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $clientDir = Join-Path $root "client"
 $specPath = Join-Path $clientDir "EncryptedChat.spec"
+$mainPy = Join-Path $clientDir "main.py"
 $distExe = Join-Path $clientDir "dist\EncryptedChat.exe"
 
 if (-not (Test-Path $specPath)) {
     throw "Spec file not found: $specPath"
+}
+if (-not (Test-Path $mainPy)) {
+    throw "Client main.py not found: $mainPy"
+}
+
+$releaseVersion = $Tag
+if ($releaseVersion.StartsWith("version_")) {
+    $releaseVersion = $releaseVersion.Substring(8)
+}
+elseif ($releaseVersion.StartsWith("v")) {
+    $releaseVersion = $releaseVersion.Substring(1)
 }
 
 Invoke-Step -Name "Validate tooling" -Action {
@@ -47,6 +59,13 @@ Invoke-Step -Name "Check GitHub auth" -Action {
 }
 
 Invoke-Step -Name "Build EncryptedChat.exe" -Action {
+    $mainContent = Get-Content -Path $mainPy -Raw -Encoding UTF8
+    $updatedMain = [regex]::Replace($mainContent, 'CLIENT_VERSION\s*=\s*"[^"]+"', "CLIENT_VERSION = \"$releaseVersion\"")
+    if ($updatedMain -eq $mainContent) {
+        throw "Failed to update CLIENT_VERSION in $mainPy"
+    }
+    Set-Content -Path $mainPy -Value $updatedMain -Encoding UTF8
+
     Push-Location $clientDir
     try {
         if (Test-Path (Join-Path $clientDir "build")) {

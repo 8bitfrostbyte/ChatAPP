@@ -36,7 +36,20 @@ jobs:
           if (-not $tag.StartsWith("v")) {
             throw "Tag must start with 'v' (example: v1.0.2)"
           }
+          $version = $tag.Substring(1)
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Set Client Version
+        shell: pwsh
+        run: |
+          $mainPath = "encrypted-chat-app/client/main.py"
+          $content = Get-Content -Path $mainPath -Raw -Encoding UTF8
+          $updated = $content -replace 'CLIENT_VERSION\s*=\s*"[^"]+"', 'CLIENT_VERSION = "${{ steps.tag.outputs.version }}"'
+          if ($updated -eq $content) {
+            throw "Failed to update CLIENT_VERSION in $mainPath"
+          }
+          Set-Content -Path $mainPath -Value $updated -Encoding UTF8
 
       - name: Setup Python
         uses: actions/setup-python@v5
