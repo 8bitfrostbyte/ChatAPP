@@ -13,8 +13,10 @@ import os
 import shutil
 import random
 import mimetypes
+import re
 from pathlib import Path
 from contextlib import suppress
+import requests
 
 # Import our modules
 from database import (
@@ -43,6 +45,12 @@ app.add_middleware(
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# Update service configuration (server checks GitHub, clients download via server)
+UPDATE_GITHUB_REPO = os.getenv("UPDATE_GITHUB_REPO", "")  # Format: owner/repo
+UPDATE_ASSET_NAME = os.getenv("UPDATE_ASSET_NAME", "EncryptedChat.exe")
+UPDATE_CACHE_DIR = Path("updates")
+UPDATE_CACHE_DIR.mkdir(exist_ok=True)
+
 # WebSocket connections manager
 class ConnectionManager:
     def __init__(self):
@@ -69,6 +77,100 @@ class ConnectionManager:
                     pass
 
 manager = ConnectionManager()
+
+
+def _parse_version_tuple(value: str) -> tuple:
+    """Parse semantic-ish version text into a comparable integer tuple."""
+    parts = [int(p) for p in re.findall(r"\d+", str(value or ""))[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _is_newer_version(latest: str, current: str) -> bool:
+    return _parse_version_tuple(latest) > _parse_version_tuple(current)
+
+
+def _extract_release_version(release_json: dict) -> str:
+    tag = str(release_json.get("tag_name") or "").strip()
+    if tag.lower().startswith("v"):
+        tag = tag[1:]
+    return tag or "0.0.0"
+
+
+def _pick_release_asset(release_json: dict) -> Optional[dict]:
+    assets = release_json.get("assets") or []
+    if not isinstance(assets, list):
+        return None
+
+    # Hard requirement: updater serves executables only.
+    configured_name = str(UPDATE_ASSET_NAME or "").strip()
+    if configured_name and not configured_name.lower().endswith(".exe"):
+        raise RuntimeError("UPDATE_ASSET_NAME must be an .exe file")
+
+    # Prefer explicit configured asset, then any .exe asset.
+    for asset in assets:
+        name = str(asset.get("name", "")).strip()
+        if not name.lower().endswith(".exe"):
+            continue
+        if name.lower() == configured_name.lower():
+            return asset
+    for asset in assets:
+        if str(asset.get("name", "")).strip().lower().endswith(".exe"):
+            return asset
+    return None
+
+
+def _fetch_latest_release() -> dict:
+    """Return normalized latest release metadata from GitHub."""
+    if not UPDATE_GITHUB_REPO or "/" not in UPDATE_GITHUB_REPO:
+        raise RuntimeError("UPDATE_GITHUB_REPO is not configured (expected owner/repo)")
+
+    url = f"https://api.github.com/repos/{UPDATE_GITHUB_REPO}/releases/latest"
+    response = requests.get(url, timeout=15, headers={"Accept": "application/vnd.github+json"})
+    if response.status_code != 200:
+        raise RuntimeError(f"GitHub release check failed ({response.status_code})")
+
+    parsed = response.json()
+    release_json = parsed if isinstance(parsed, dict) else {}
+    asset = _pick_release_asset(release_json)
+    if not asset:
+        raise RuntimeError("No EXE asset found in latest GitHub release")
+
+    return {
+        "tag_name": str(release_json.get("tag_name", "")),
+        "version": _extract_release_version(release_json),
+        "name": str(release_json.get("name", "")),
+        "published_at": release_json.get("published_at"),
+        "body": str(release_json.get("body", "")),
+        "asset_name": str(asset.get("name", UPDATE_ASSET_NAME)),
+        "asset_url": str(asset.get("browser_download_url", "")),
+    }
+
+
+def _ensure_cached_release_exe(release_info: dict) -> Path:
+    """Download latest release EXE to local cache and return its path."""
+    version = release_info.get("version", "0.0.0")
+    asset_name = release_info.get("asset_name", UPDATE_ASSET_NAME)
+    asset_url = release_info.get("asset_url", "")
+    if not asset_url:
+        raise RuntimeError("Release asset URL missing")
+    if not str(asset_name).lower().endswith(".exe"):
+        raise RuntimeError("Latest release asset is not an EXE")
+
+    target_path = UPDATE_CACHE_DIR / f"{version}_{asset_name}"
+    if target_path.exists() and target_path.stat().st_size > 0:
+        return target_path
+
+    with requests.get(asset_url, timeout=60, stream=True) as resp:
+        if resp.status_code != 200:
+            raise RuntimeError(f"Failed to download release EXE ({resp.status_code})")
+        with open(target_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+
+    return target_path
 
 
 def ensure_room_encryption_key(db: Session, room: Room) -> bytes:
@@ -581,7 +683,13 @@ async def join_room(
     
     await manager.broadcast(room_id, {
         "type": "user_joined",
+        "room_id": room_id,
         "username": user.username,
+        "message": f"{user.username} is online"
+    })
+    await manager.broadcast(room_id, {
+        "type": "system_message",
+        "room_id": room_id,
         "message": f"{user.username} is online"
     })
     
@@ -625,7 +733,13 @@ async def leave_room(
     
     await manager.broadcast(room_id, {
         "type": "user_left",
+        "room_id": room_id,
         "username": user.username,
+        "message": f"{user.username} is offline"
+    })
+    await manager.broadcast(room_id, {
+        "type": "system_message",
+        "room_id": room_id,
         "message": f"{user.username} is offline"
     })
     
@@ -1325,6 +1439,44 @@ async def websocket_endpoint(room_id: int, token: str, websocket: WebSocket):
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy"}
+
+
+@app.get("/api/update/check")
+async def check_for_update(current_version: str = Query("0.0.0")):
+    """Check GitHub latest release from the server and report update availability."""
+    try:
+        latest = _fetch_latest_release()
+        latest_version = latest.get("version", "0.0.0")
+        return {
+            "update_available": _is_newer_version(latest_version, current_version),
+            "current_version": current_version,
+            "latest_version": latest_version,
+            "release_name": latest.get("name", ""),
+            "published_at": latest.get("published_at"),
+            "notes": latest.get("body", ""),
+            "asset_name": latest.get("asset_name", UPDATE_ASSET_NAME),
+            "repo": UPDATE_GITHUB_REPO,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Update check failed: {e}")
+
+
+@app.get("/api/update/download")
+async def download_latest_update():
+    """Download latest EXE from GitHub to server cache and stream it to the client."""
+    try:
+        latest = _fetch_latest_release()
+        asset_name = str(latest.get("asset_name", UPDATE_ASSET_NAME))
+        if not asset_name.lower().endswith(".exe"):
+            raise RuntimeError("Refusing to serve non-EXE update asset")
+        exe_path = _ensure_cached_release_exe(latest)
+        return FileResponse(
+            path=str(exe_path),
+            media_type="application/octet-stream",
+            filename=asset_name,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Update download failed: {e}")
 
 
 if __name__ == "__main__":

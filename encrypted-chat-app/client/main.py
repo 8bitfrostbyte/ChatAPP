@@ -4,10 +4,13 @@ PyQt6-based user interface for Windows.
 """
 
 import sys
+import os
 import copy
 import asyncio
 import json
 import requests
+import subprocess
+import tempfile
 import base64
 import html
 import re
@@ -32,6 +35,8 @@ from PyQt6.QtGui import QDesktopServices
 
 from websocket_client import WebSocketClient
 from notification_handler import NotificationHandler
+
+CLIENT_VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # Theme system
@@ -628,6 +633,44 @@ class APIClient:
         except Exception as e:
             return False, str(e)
 
+    def check_for_update(self, current_version: str) -> tuple:
+        """Ask server whether a newer client build is available."""
+        try:
+            response = requests.get(
+                f"{self.server_url}/api/update/check",
+                params={"current_version": current_version},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True, response.json()
+            return False, response.json().get("detail", "Update check failed")
+        except Exception as e:
+            return False, str(e)
+
+    def download_update_file(self, destination_path: str) -> tuple:
+        """Download latest update EXE from server to destination path."""
+        try:
+            response = requests.get(
+                f"{self.server_url}/api/update/download",
+                stream=True,
+                timeout=120,
+            )
+            if response.status_code != 200:
+                try:
+                    return False, response.json().get("detail", "Update download failed")
+                except Exception:
+                    return False, f"Update download failed ({response.status_code})"
+
+            dest = Path(destination_path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+            return True, {"path": str(dest)}
+        except Exception as e:
+            return False, str(e)
+
 
 class WebSocketThread(QThread):
     """Thread for managing WebSocket connection."""
@@ -836,6 +879,8 @@ class ChatWindow(QMainWindow):
         self._room_list_snapshot = []
         self._rooms_data: Dict[int, dict] = {}  # room_id -> {is_private, created_by}
         self._room_select_epoch = 0
+        self._pending_update_info: Dict = {}
+        self._last_update_notice_version = ""
         self.settings_path = self._resolve_settings_path()
         self._theme: Dict = copy.deepcopy(_THEME_DEFAULTS)
         self._load_user_settings()
@@ -1028,6 +1073,12 @@ class ChatWindow(QMainWindow):
         self.room_refresh_thread = RoomRefreshThread(self.api_client)
         self.room_refresh_thread.rooms_fetched.connect(self._update_room_list)
         self.room_refresh_thread.start()
+
+        # Keep room member list fresh even if a live WS presence event is missed.
+        self.members_refresh_timer = QTimer(self)
+        self.members_refresh_timer.setInterval(3000)
+        self.members_refresh_timer.timeout.connect(self.refresh_members)
+        self.members_refresh_timer.start()
     
     def show_login(self) -> bool:
         """Show login dialog. Returns True only on successful login."""
@@ -1037,8 +1088,116 @@ class ChatWindow(QMainWindow):
             self.setWindowTitle(f"Encrypted Chat - {self.api_client.username}")
             self.refresh_rooms()
             self.auto_join_default_room()
+            self.check_for_updates(manual=False)
+
+            self.update_check_timer = QTimer(self)
+            self.update_check_timer.setInterval(15 * 60 * 1000)
+            self.update_check_timer.timeout.connect(lambda: self.check_for_updates(manual=False))
+            self.update_check_timer.start()
             return True
         return False
+
+    def check_for_updates(self, manual: bool = False, done_callback=None):
+        """Check server-managed GitHub update status and announce in-app when available."""
+        def _fetch(version_text):
+            return self.api_client.check_for_update(version_text)
+
+        def _apply(result):
+            success, payload = result if result else (False, "Update check failed")
+            if success and isinstance(payload, dict):
+                self._pending_update_info = payload
+                latest = str(payload.get("latest_version", "")).strip()
+                if payload.get("update_available") and latest and latest != self._last_update_notice_version:
+                    self._last_update_notice_version = latest
+                    self.append_system_message(
+                        f"Update available: v{latest} (current v{CLIENT_VERSION}). Open Settings > Updates to install."
+                    )
+                elif manual and not payload.get("update_available"):
+                    self.append_system_message(f"No update available. Current version: v{CLIENT_VERSION}.")
+            else:
+                if manual:
+                    self.append_system_message(f"Update check failed: {payload}")
+
+            if done_callback:
+                done_callback(success, payload)
+
+        self._run_in_bg(_fetch, _apply, CLIENT_VERSION)
+
+    def install_update_from_server(self, done_callback=None):
+        """Download latest update via server; replace EXE on restart when packaged."""
+        latest = str(self._pending_update_info.get("latest_version", "")).strip() or "latest"
+
+        if getattr(sys, "frozen", False):
+            current_exe = Path(sys.executable)
+            new_exe = current_exe.with_name(f"{current_exe.stem}.new.exe")
+
+            def _fetch(target_path):
+                return self.api_client.download_update_file(str(target_path))
+
+            def _apply(result):
+                success, payload = result if result else (False, "Update download failed")
+                if not success:
+                    self.append_system_message(f"Update download failed: {payload}")
+                    if done_callback:
+                        done_callback(False, payload)
+                    return
+
+                updater_bat = Path(tempfile.gettempdir()) / f"encrypted_chat_update_{os.getpid()}.bat"
+                script = (
+                    "@echo off\n"
+                    "setlocal\n"
+                    f"set \"PID={os.getpid()}\"\n"
+                    f"set \"SRC={str(new_exe)}\"\n"
+                    f"set \"DST={str(current_exe)}\"\n"
+                    ":waitproc\n"
+                    "tasklist /FI \"PID eq %PID%\" | find \"%PID%\" >nul\n"
+                    "if not errorlevel 1 (\n"
+                    "  timeout /t 1 /nobreak >nul\n"
+                    "  goto waitproc\n"
+                    ")\n"
+                    ":copyretry\n"
+                    "copy /Y \"%SRC%\" \"%DST%\" >nul\n"
+                    "if errorlevel 1 (\n"
+                    "  timeout /t 1 /nobreak >nul\n"
+                    "  goto copyretry\n"
+                    ")\n"
+                    "start \"\" \"%DST%\"\n"
+                    "del /f /q \"%SRC%\" >nul 2>&1\n"
+                    "del /f /q \"%~f0\" >nul 2>&1\n"
+                )
+
+                try:
+                    updater_bat.write_text(script, encoding="utf-8")
+                    self.append_system_message(f"Update v{latest} downloaded. Restarting to apply update...")
+                    subprocess.Popen(["cmd", "/c", str(updater_bat)], creationflags=0x08000000)
+                    QTimer.singleShot(300, self.close)
+                    if done_callback:
+                        done_callback(True, payload)
+                except Exception as e:
+                    self.append_system_message(f"Failed to prepare updater: {e}")
+                    if done_callback:
+                        done_callback(False, str(e))
+
+            self._run_in_bg(_fetch, _apply, new_exe)
+            return
+
+        # Source-run fallback: just download to a local folder and notify user.
+        download_dir = self.settings_path.parent / "downloads"
+        output_file = download_dir / f"EncryptedChat-v{latest}.exe"
+
+        def _fetch_source(target_path):
+            return self.api_client.download_update_file(str(target_path))
+
+        def _apply_source(result):
+            success, payload = result if result else (False, "Update download failed")
+            if success:
+                self.append_system_message(f"Update downloaded: {output_file}")
+            else:
+                self.append_system_message(f"Update download failed: {payload}")
+            if done_callback:
+                done_callback(success, payload)
+
+        self._run_in_bg(_fetch_source, _apply_source, output_file)
 
     @staticmethod
     def _is_hex_color(value: str) -> bool:
@@ -2494,15 +2653,12 @@ class ChatWindow(QMainWindow):
             self.notification_handler.notify_message_received(username, content[:50])
     
     def on_user_joined(self, data: dict):
-        """Handle user joined — suppress the notice for the user who joined."""
+        """Handle user joined and refresh member list."""
         username = data.get("username", "Unknown")
-        # The user who triggered the join already knows they joined; only show to others.
-        if username == self.api_client.username:
-            self.refresh_members()
-            return
         message = f"{username} is online"
         self.append_chat_message("SYSTEM", message, "system")
-        self.notification_handler.notify_user_joined(username)
+        if username != self.api_client.username:
+            self.notification_handler.notify_user_joined(username)
         self.refresh_members()
     
     def on_user_left(self, data: dict):
@@ -2589,7 +2745,58 @@ class ChatWindow(QMainWindow):
         notif_widget.setLayout(notif_layout)
         tabs.addTab(notif_widget, "Notifications")
 
-        # ── Tab 2: Appearance (Basic) ───────────────────────────────────────
+        # ── Tab 2: Updates ──────────────────────────────────────────────────
+        updates_widget = QWidget()
+        updates_layout = QVBoxLayout()
+        updates_layout.addWidget(QLabel(f"Current client version: v{CLIENT_VERSION}"))
+
+        update_status_label = QLabel("Checking status: not checked yet")
+        update_status_label.setWordWrap(True)
+        updates_layout.addWidget(update_status_label)
+
+        check_updates_btn = QPushButton("Check for Updates")
+        install_update_btn = QPushButton("Download && Install Update")
+        updates_layout.addWidget(check_updates_btn)
+        updates_layout.addWidget(install_update_btn)
+        updates_layout.addStretch()
+
+        def _render_update_status(success=None, payload=None):
+            info = payload if isinstance(payload, dict) else self._pending_update_info
+            if success is False and payload is not None and not isinstance(payload, dict):
+                update_status_label.setText(f"Update check failed: {payload}")
+                return
+            if not isinstance(info, dict) or not info:
+                update_status_label.setText("Checking status: not checked yet")
+                return
+
+            latest = str(info.get("latest_version", "unknown"))
+            if info.get("update_available"):
+                update_status_label.setText(
+                    f"New version available: v{latest}. Press 'Download && Install Update' to apply it."
+                )
+            else:
+                update_status_label.setText(f"You are up to date (v{CLIENT_VERSION}).")
+
+        def _on_check_click():
+            update_status_label.setText("Checking for updates...")
+            self.check_for_updates(manual=True, done_callback=_render_update_status)
+
+        def _on_install_click():
+            if not self._pending_update_info.get("update_available"):
+                self.append_system_message("No update available to install.")
+                _render_update_status(True, self._pending_update_info)
+                return
+            update_status_label.setText("Downloading update from server...")
+            self.install_update_from_server(done_callback=lambda s, p: _render_update_status(s, self._pending_update_info))
+
+        check_updates_btn.clicked.connect(_on_check_click)
+        install_update_btn.clicked.connect(_on_install_click)
+        _render_update_status()
+
+        updates_widget.setLayout(updates_layout)
+        tabs.addTab(updates_widget, "Updates")
+
+        # ── Tab 3: Appearance (Basic) ───────────────────────────────────────
         basic_widget = QWidget()
         basic_layout = QVBoxLayout()
 
@@ -2740,7 +2947,7 @@ class ChatWindow(QMainWindow):
         basic_widget.setLayout(basic_layout)
         tabs.addTab(basic_widget, "Appearance")
 
-        # ── Tab 3: Appearance (Advanced) ─────────────────────────────────────
+        # ── Tab 4: Appearance (Advanced) ─────────────────────────────────────
         app_scroll = QScrollArea()
         app_scroll.setWidgetResizable(True)
         app_inner = QWidget()
@@ -3197,6 +3404,10 @@ class ChatWindow(QMainWindow):
     def closeEvent(self, event):
         """Handle window close."""
         self._save_user_settings()
+        if hasattr(self, "members_refresh_timer") and self.members_refresh_timer is not None:
+            self.members_refresh_timer.stop()
+        if hasattr(self, "update_check_timer") and self.update_check_timer is not None:
+            self.update_check_timer.stop()
         if self.current_room:
             # Best effort to announce offline state when app closes.
             room_id = self.current_room
