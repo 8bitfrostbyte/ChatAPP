@@ -178,6 +178,47 @@ _THEME_PRESETS: Dict = {
 }
 
 
+def _resolve_user_settings_path() -> Path:
+    """Return a writable per-user settings path."""
+    app_data = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+    if app_data:
+        settings_dir = Path(app_data)
+    else:
+        settings_dir = Path.home() / ".encrypted-chat"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    return settings_dir / "user_settings.json"
+
+
+def _load_saved_server_url(default: str = "http://localhost:8000") -> str:
+    """Load last used server URL for startup prompt."""
+    try:
+        settings_path = _resolve_user_settings_path()
+        if not settings_path.exists():
+            return default
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        value = str(data.get("server_url", "")).strip()
+        if value.lower().startswith(("http://", "https://")):
+            return value
+    except Exception:
+        pass
+    return default
+
+
+def _save_server_url(server_url: str):
+    """Persist last used server URL without overwriting other settings."""
+    try:
+        settings_path = _resolve_user_settings_path()
+        payload = {}
+        if settings_path.exists():
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        payload["server_url"] = str(server_url or "").strip()
+        settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 class APIClient:
     """Client for interacting with the server REST API."""
     
@@ -679,27 +720,49 @@ class APIClient:
 
     def download_update_file(self, destination_path: str) -> tuple:
         """Download latest update EXE from server to destination path."""
-        try:
-            response = requests.get(
-                f"{self.server_url}/api/update/download",
-                stream=True,
-                timeout=120,
-            )
-            if response.status_code != 200:
-                try:
-                    return False, response.json().get("detail", "Update download failed")
-                except Exception:
-                    return False, f"Update download failed ({response.status_code})"
+        dest = Path(destination_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
 
-            dest = Path(destination_path)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 256):
-                    if chunk:
-                        f.write(chunk)
-            return True, {"path": str(dest)}
-        except Exception as e:
-            return False, str(e)
+        last_error = "Update download failed"
+        for attempt in range(1, 3):
+            try:
+                with requests.get(
+                    f"{self.server_url}/api/update/download",
+                    stream=True,
+                    timeout=(10, 30),
+                ) as response:
+                    if response.status_code != 200:
+                        try:
+                            return False, response.json().get("detail", "Update download failed")
+                        except Exception:
+                            return False, f"Update download failed ({response.status_code})"
+
+                    tmp_path = dest.with_suffix(dest.suffix + ".part")
+                    started_at = time.monotonic()
+                    with open(tmp_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=1024 * 256):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+
+                            # Prevent endless hangs on bad/half-open connections.
+                            if time.monotonic() - started_at > 15 * 60:
+                                raise TimeoutError("Download timed out after 15 minutes")
+
+                    tmp_path.replace(dest)
+                    return True, {"path": str(dest)}
+            except Exception as e:
+                last_error = str(e)
+                try:
+                    part_path = dest.with_suffix(dest.suffix + ".part")
+                    if part_path.exists():
+                        part_path.unlink()
+                except Exception:
+                    pass
+                if attempt < 2:
+                    time.sleep(1.0)
+
+        return False, last_error
 
 
 class WebSocketThread(QThread):
@@ -1221,6 +1284,7 @@ class ChatWindow(QMainWindow):
                 return self.api_client.download_update_file(str(target_path))
 
             def _apply(result):
+                progress_state["done"] = True
                 success, payload = result if result else (False, "Update download failed")
                 if not success:
                     self.append_system_message(f"Update download failed: {payload}")
@@ -1267,6 +1331,18 @@ class ChatWindow(QMainWindow):
                     if done_callback:
                         done_callback(False, str(e))
 
+            progress_state = {"done": False}
+
+            def _heartbeat():
+                if progress_state["done"]:
+                    return
+                self.append_system_message("Update download still in progress. Please wait...")
+                QTimer.singleShot(60000, _heartbeat)
+
+            self.append_system_message(
+                f"Downloading update v{latest}. This can take a few minutes the first time."
+            )
+            QTimer.singleShot(60000, _heartbeat)
             self._run_in_bg(_fetch, _apply, new_exe)
             return
 
@@ -3452,13 +3528,7 @@ class ChatWindow(QMainWindow):
 
     def _resolve_settings_path(self) -> Path:
         """Return a writable per-user settings path (works for source runs and packaged EXE)."""
-        app_data = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
-        if app_data:
-            settings_dir = Path(app_data)
-        else:
-            settings_dir = Path.home() / ".encrypted-chat"
-        settings_dir.mkdir(parents=True, exist_ok=True)
-        return settings_dir / "user_settings.json"
+        return _resolve_user_settings_path()
 
     def _load_user_settings(self):
         """Load persisted client-side settings."""
@@ -3486,6 +3556,7 @@ class ChatWindow(QMainWindow):
                 "sound_enabled": self.notification_handler.sound_enabled,
                 "custom_sound_path": self.notification_handler.custom_sound_path,
                 "theme": self._sanitize_theme(self._theme),
+                "server_url": self.server_url,
             }
             self.settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception:
@@ -3566,16 +3637,21 @@ def main():
     
     app_instance = QApplication(sys.argv)
     
-    # Get server URL from user (or use default)
+    default_server_url = _load_saved_server_url("http://localhost:8000")
+
+    # Get server URL from user (or use saved/default)
     server_url, ok = QInputDialog.getText(
         None,
         "Server Configuration",
-        "Server URL (default: http://localhost:8000):",
-        text="http://localhost:8000"
+        "Server URL:",
+        text=default_server_url
     )
     
     if not ok:
         sys.exit(1)
+
+    server_url = str(server_url or "").strip() or default_server_url
+    _save_server_url(server_url)
     
     app = ChatApp(sys.argv, server_url)
     sys.exit(app.exec())
