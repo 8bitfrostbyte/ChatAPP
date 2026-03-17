@@ -190,6 +190,31 @@ class ImageBot:
 
     def remove_tags(self, tags: str) -> Dict:
         """Remove tags from saved and start pools."""
+        numeric = str(tags or "").strip()
+        if numeric.isdigit():
+            remove_count = int(numeric)
+            if remove_count <= 0:
+                return {
+                    "removed": 0,
+                    "saved_tags": sorted(self.config.saved_tags),
+                    "start_tags": sorted(self.config.start_tags),
+                }
+
+            # Deterministic removal order matches displayed taglist order.
+            ordered_saved = sorted(self.config.saved_tags)
+            to_remove = ordered_saved[:remove_count]
+            removed = len(to_remove)
+            for tag in to_remove:
+                self.config.saved_tags.discard(tag)
+                self.config.start_tags.discard(tag)
+
+            self.save_saved_tags()
+            return {
+                "removed": removed,
+                "saved_tags": sorted(self.config.saved_tags),
+                "start_tags": sorted(self.config.start_tags),
+            }
+
         tag_list = self.parse_tag_list(tags)
         removed = 0
 

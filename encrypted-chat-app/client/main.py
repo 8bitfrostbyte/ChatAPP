@@ -12,6 +12,8 @@ import base64
 import html
 import re
 import time
+import threading
+import mimetypes
 from typing import Optional, List, Dict
 from datetime import datetime
 from urllib.parse import urlparse
@@ -22,10 +24,10 @@ from PyQt6.QtWidgets import (
     QTabWidget, QListWidget, QListWidgetItem, QLineEdit, QPushButton,
     QTextEdit, QTextBrowser, QLabel, QMessageBox, QDialog, QDialogButtonBox,
     QComboBox, QFileDialog, QScrollArea, QInputDialog, QSplitter,
-    QColorDialog, QSpinBox
+    QColorDialog, QSpinBox, QCheckBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
-from PyQt6.QtGui import QIcon, QPixmap, QFont
+from PyQt6.QtGui import QIcon, QPixmap, QFont, QFontDatabase
 from PyQt6.QtGui import QDesktopServices
 
 from websocket_client import WebSocketClient
@@ -37,13 +39,30 @@ from notification_handler import NotificationHandler
 _THEME_DEFAULTS: Dict = {
     "window_bg":      "#141a24",
     "panel_bg":       "#1d2533",
+    "header_bg":      "#0f1520",
+    "chat_bg":        "#1d2533",
+    "input_bg":       "#1d2533",
     "border_color":   "#2f3d54",
     "text_color":     "#e8edf5",
     "button_bg":      "#244063",
     "button_border":  "#33547c",
     "button_text":    "#edf3ff",
+    "timestamp_color": "#9aa8ba",
+    "link_color":     "#7fb4ff",
     "font_family":    "",
     "font_size":      13,
+    "font_weight":    600,
+    "widget_radius":  8,
+    "button_radius":  8,
+    "border_width":   1,
+    "timestamp_size": 11,
+    "username_weight": 700,
+    "message_spacing": 4,
+    "system_italic":  True,
+    "image_max_width": 420,
+    "image_max_height": 320,
+    "image_radius":   6,
+    "splitter_handle_size": 8,
     "msg_own_name":   "#8df2d4",
     "msg_other_name": "#9bc3ff",
     "msg_own_text":   "#d8f1ec",
@@ -60,10 +79,10 @@ _THEME_PRESETS: Dict = {
         "font_family": "", "font_size": 13,
     },
     "PowerShell": {
-        "window_bg": "#012456", "panel_bg": "#001232", "border_color": "#1a3f6f",
-        "text_color": "#eeedf0", "button_bg": "#003080", "button_border": "#1a5096",
-        "button_text": "#ffffff", "msg_own_name": "#ffff00", "msg_other_name": "#00dfff",
-        "msg_own_text": "#eeedf0", "msg_other_text": "#eeedf0", "system_color": "#aaaaaa",
+        "window_bg": "#000000", "panel_bg": "#000000", "border_color": "#2b2b2b",
+        "text_color": "#f0f0f0", "button_bg": "#111111", "button_border": "#3a3a3a",
+        "button_text": "#f0f0f0", "msg_own_name": "#ffff00", "msg_other_name": "#00ffff",
+        "msg_own_text": "#f0f0f0", "msg_other_text": "#f0f0f0", "system_color": "#b0b0b0",
         "font_family": "Consolas", "font_size": 13,
     },
     "Light": {
@@ -86,6 +105,69 @@ _THEME_PRESETS: Dict = {
         "button_text": "#d8f4d8", "msg_own_name": "#80ff80", "msg_other_name": "#60c890",
         "msg_own_text": "#b8e8b8", "msg_other_text": "#c0dcc0", "system_color": "#709070",
         "font_family": "", "font_size": 13,
+    },
+    "Matrix CRT": {
+        "window_bg": "#000000", "panel_bg": "#000000", "border_color": "#154215",
+        "text_color": "#7dff7d", "button_bg": "#001700", "button_border": "#1d5c1d",
+        "button_text": "#8dff8d", "msg_own_name": "#baff00", "msg_other_name": "#6cff6c",
+        "msg_own_text": "#9eff9e", "msg_other_text": "#7dff7d", "system_color": "#4dcf4d",
+        "font_family": "Lucida Console", "font_size": 13,
+    },
+    "Amber Terminal": {
+        "window_bg": "#0a0700", "panel_bg": "#0a0700", "border_color": "#4a2c00",
+        "text_color": "#ffb000", "button_bg": "#1a1200", "button_border": "#6f4200",
+        "button_text": "#ffbf40", "msg_own_name": "#ffd86b", "msg_other_name": "#ff9e2f",
+        "msg_own_text": "#ffc862", "msg_other_text": "#ffb94d", "system_color": "#c8871a",
+        "font_family": "Consolas", "font_size": 13,
+    },
+    "Cyberpunk Neon": {
+        "window_bg": "#0a0014", "panel_bg": "#140025", "border_color": "#3c1b66",
+        "text_color": "#f6dcff", "button_bg": "#2f0a52", "button_border": "#6c2aa6",
+        "button_text": "#ffe8ff", "msg_own_name": "#ff5ec4", "msg_other_name": "#3de6ff",
+        "msg_own_text": "#ffd3f1", "msg_other_text": "#c6f7ff", "system_color": "#b69ad1",
+        "font_family": "Segoe UI", "font_size": 13,
+    },
+    "Solarized Dark": {
+        "window_bg": "#002b36", "panel_bg": "#073642", "border_color": "#1f5665",
+        "text_color": "#93a1a1", "button_bg": "#0f4c5c", "button_border": "#2b6877",
+        "button_text": "#dbe6e6", "msg_own_name": "#2aa198", "msg_other_name": "#268bd2",
+        "msg_own_text": "#b5c2c2", "msg_other_text": "#c4d1d1", "system_color": "#839496",
+        "font_family": "Cascadia Code", "font_size": 13,
+    },
+    "Gruvbox": {
+        "window_bg": "#282828", "panel_bg": "#1d2021", "border_color": "#504945",
+        "text_color": "#ebdbb2", "button_bg": "#3c3836", "button_border": "#665c54",
+        "button_text": "#fbf1c7", "msg_own_name": "#b8bb26", "msg_other_name": "#83a598",
+        "msg_own_text": "#ebdbb2", "msg_other_text": "#d5c4a1", "system_color": "#a89984",
+        "font_family": "", "font_size": 13,
+    },
+    "Ice Cave": {
+        "window_bg": "#dff6ff", "panel_bg": "#ffffff", "border_color": "#9ec7dd",
+        "text_color": "#0f2b3a", "button_bg": "#b9e4f7", "button_border": "#86bfd8",
+        "button_text": "#0f2d3f", "msg_own_name": "#005f8d", "msg_other_name": "#4c3bff",
+        "msg_own_text": "#12384d", "msg_other_text": "#1a2d5c", "system_color": "#4f6f82",
+        "font_family": "", "font_size": 13,
+    },
+    "High Contrast": {
+        "window_bg": "#000000", "panel_bg": "#000000", "border_color": "#ffffff",
+        "text_color": "#ffffff", "button_bg": "#000000", "button_border": "#ffffff",
+        "button_text": "#ffffff", "msg_own_name": "#ffff00", "msg_other_name": "#00ffff",
+        "msg_own_text": "#ffffff", "msg_other_text": "#ffffff", "system_color": "#ff00ff",
+        "font_family": "Arial", "font_size": 14,
+    },
+    "Goblin Mode": {
+        "window_bg": "#1c1500", "panel_bg": "#281d00", "border_color": "#4f3200",
+        "text_color": "#d0ff00", "button_bg": "#3d2b00", "button_border": "#6c4700",
+        "button_text": "#f2ff8a", "msg_own_name": "#ff6a00", "msg_other_name": "#9eff00",
+        "msg_own_text": "#e8ff7a", "msg_other_text": "#ceff44", "system_color": "#c1a735",
+        "font_family": "Comic Sans MS", "font_size": 13,
+    },
+    "Arcade Glitch": {
+        "window_bg": "#080808", "panel_bg": "#111111", "border_color": "#3a3a3a",
+        "text_color": "#f5f5f5", "button_bg": "#191919", "button_border": "#4c4c4c",
+        "button_text": "#ffffff", "msg_own_name": "#ff0055", "msg_other_name": "#00e5ff",
+        "msg_own_text": "#ffc7d8", "msg_other_text": "#c7f8ff", "system_color": "#b3b3b3",
+        "font_family": "OCR A Extended", "font_size": 13,
     },
 }
 
@@ -324,7 +406,8 @@ class APIClient:
         """Upload a file/image."""
         try:
             with open(file_path, "rb") as f:
-                files = {"file": f}
+                guessed_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+                files = {"file": (Path(file_path).name, f, guessed_type)}
                 response = requests.post(
                     f"{self.server_url}/api/upload",
                     params={"room_id": room_id},
@@ -736,6 +819,7 @@ class ChatWindow(QMainWindow):
         self._last_presence_message = None
         self._last_presence_at = 0.0
         self._seen_live_message_keys = set()
+        self._uploaded_image_urls_by_message_id: Dict[int, str] = {}
         self._room_list_snapshot = []
         self._rooms_data: Dict[int, dict] = {}  # room_id -> {is_private, created_by}
         self._room_select_epoch = 0
@@ -759,6 +843,7 @@ class ChatWindow(QMainWindow):
 
         # Header row
         header_widget = QWidget()
+        header_widget.setObjectName("HeaderBar")
         header_widget.setMinimumHeight(0)
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(4, 4, 4, 2)
@@ -842,6 +927,7 @@ class ChatWindow(QMainWindow):
         self.chat_splitter.setOpaqueResize(True)
 
         self.message_display = QTextBrowser()
+        self.message_display.setObjectName("ChatDisplay")
         self.message_display.setMinimumHeight(0)
         self.message_display.setReadOnly(True)
         self.message_display.setOpenExternalLinks(False)
@@ -854,6 +940,7 @@ class ChatWindow(QMainWindow):
         composer_layout.setContentsMargins(0, 0, 0, 0)
 
         self.message_input = QLineEdit()
+        self.message_input.setObjectName("ChatInput")
         self.message_input.returnPressed.connect(self.send_message)
         composer_layout.addWidget(self.message_input)
 
@@ -940,20 +1027,88 @@ class ChatWindow(QMainWindow):
             return True
         return False
 
+    @staticmethod
+    def _is_hex_color(value: str) -> bool:
+        return bool(re.fullmatch(r"#[0-9a-fA-F]{6}", str(value or "").strip()))
+
+    def _sanitize_theme(self, raw_theme: Optional[dict]) -> Dict:
+        """Normalize untrusted theme data into a safe, complete theme dict."""
+        theme = copy.deepcopy(_THEME_DEFAULTS)
+        if not isinstance(raw_theme, dict):
+            return theme
+
+        color_keys = {
+            "window_bg", "panel_bg", "header_bg", "chat_bg", "input_bg", "border_color",
+            "text_color", "button_bg", "button_border", "button_text", "timestamp_color",
+            "link_color", "msg_own_name", "msg_other_name", "msg_own_text", "msg_other_text",
+            "system_color",
+        }
+        int_ranges = {
+            "font_size": (8, 36),
+            "font_weight": (100, 900),
+            "widget_radius": (0, 24),
+            "button_radius": (0, 24),
+            "border_width": (1, 4),
+            "timestamp_size": (8, 22),
+            "username_weight": (100, 900),
+            "message_spacing": (0, 20),
+            "image_max_width": (120, 1600),
+            "image_max_height": (120, 1200),
+            "image_radius": (0, 24),
+            "splitter_handle_size": (4, 24),
+        }
+        available_fonts = set(QFontDatabase.families())
+
+        for key, value in raw_theme.items():
+            if key not in theme:
+                continue
+            if key in color_keys:
+                if self._is_hex_color(value):
+                    theme[key] = str(value).strip()
+                continue
+            if key == "font_family":
+                font_name = str(value or "").strip()
+                theme[key] = font_name if font_name in available_fonts else ""
+                continue
+            if key == "system_italic":
+                theme[key] = bool(value)
+                continue
+            if key in int_ranges:
+                low, high = int_ranges[key]
+                try:
+                    iv = int(value)
+                except Exception:
+                    continue
+                theme[key] = max(low, min(high, iv))
+
+        return theme
+
     def _build_stylesheet(self) -> str:
         """Build a QSS stylesheet string from the current theme dict."""
         t = self._theme
         ff = t.get("font_family", "")
         fs = int(t.get("font_size", 13))
+        fw = max(100, min(900, int(t.get("font_weight", 600))))
+        wr = max(0, int(t.get("widget_radius", 8)))
+        br = max(0, int(t.get("button_radius", 8)))
+        bw = max(1, int(t.get("border_width", 1)))
+        hs = max(4, int(t.get("splitter_handle_size", 8)))
         font_widget = f"font-family: '{ff}';" if ff else ""
         font_text   = (f"font-family: '{ff}';" if ff else "") + f" font-size: {fs}px;"
         hover_btn   = t.get("button_border", "#33547c")
         pressed_btn = t.get("window_bg", "#141a24")
+        header_bg = t.get("header_bg", t.get("window_bg", "#141a24"))
+        chat_bg = t.get("chat_bg", t.get("panel_bg", "#1d2533"))
+        input_bg = t.get("input_bg", t.get("panel_bg", "#1d2533"))
         return f"""
             QMainWindow, QWidget {{
                 background-color: {t['window_bg']};
                 color: {t['text_color']};
                 {font_widget}
+            }}
+            QWidget#HeaderBar {{
+                background-color: {header_bg};
+                border-bottom: {bw}px solid {t['border_color']};
             }}
             QLabel#HeaderUserLabel, QLabel#HeaderServerLabel {{
                 color: {t['system_color']};
@@ -970,22 +1125,32 @@ class ChatWindow(QMainWindow):
                 font-weight: 700;
                 padding: 4px 2px;
             }}
-            QListWidget, QTextEdit, QLineEdit {{
+            QListWidget, QTextEdit, QTextBrowser, QLineEdit, QComboBox, QScrollArea {{
                 background-color: {t['panel_bg']};
-                border: 1px solid {t['border_color']};
-                border-radius: 8px;
+                border: {bw}px solid {t['border_color']};
+                border-radius: {wr}px;
                 padding: 6px;
                 color: {t['text_color']};
                 selection-background-color: {t['button_bg']};
                 {font_text}
             }}
+            QTextBrowser#ChatDisplay {{
+                background-color: {chat_bg};
+            }}
+            QLineEdit#ChatInput {{
+                background-color: {input_bg};
+            }}
+            QTabWidget::pane {{
+                background-color: {t['panel_bg']};
+                border: {bw}px solid {t['border_color']};
+            }}
             QPushButton {{
                 background-color: {t['button_bg']};
-                border: 1px solid {t['button_border']};
-                border-radius: 8px;
+                border: {bw}px solid {t['button_border']};
+                border-radius: {br}px;
                 padding: 7px 10px;
                 color: {t['button_text']};
-                font-weight: 600;
+                font-weight: {fw};
             }}
             QPushButton:hover {{
                 background-color: {hover_btn};
@@ -998,8 +1163,8 @@ class ChatWindow(QMainWindow):
             }}
             QSplitter::handle {{
                 background-color: {t['border_color']};
-                width: 8px;
-                height: 8px;
+                width: {hs}px;
+                height: {hs}px;
             }}
             QSplitter::handle:hover {{
                 background-color: {t['button_bg']};
@@ -1017,7 +1182,13 @@ class ChatWindow(QMainWindow):
 
     def _apply_theme(self):
         """Rebuild and apply the QSS stylesheet from current theme settings."""
+        self._theme = self._sanitize_theme(self._theme)
         self.setStyleSheet(self._build_stylesheet())
+        handle_width = int(self._theme.get("splitter_handle_size", 8))
+        for attr in ("main_splitter", "chat_splitter", "chat_area_splitter", "window_splitter"):
+            splitter = getattr(self, attr, None)
+            if splitter is not None:
+                splitter.setHandleWidth(handle_width)
 
     def apply_dark_theme(self):
         """Apply initial theme (uses persisted or default settings)."""
@@ -1030,7 +1201,82 @@ class ChatWindow(QMainWindow):
         self.toggle_sidebar_btn.setText("Expand" if self.sidebar_collapsed else "Collapse")
 
     def _extract_image_urls(self, content: str) -> List[str]:
-        return re.findall(r'https?://[^\s]+\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s]*)?', content, re.IGNORECASE)
+        if not content:
+            return []
+
+        urls = re.findall(
+            r'(?:https?://[^\s]+(?:\.(?:jpg|jpeg|png|gif|webp|bmp)(?:\?[^\s]*)?|/api/files/\d+(?:\?[^\s]*)?)|/api/files/\d+(?:\?[^\s]*)?)',
+            content,
+            re.IGNORECASE,
+        )
+
+        normalized = []
+        for url in urls:
+            if url.startswith("/"):
+                normalized.append(f"{self.server_url.rstrip('/')}{url}")
+            else:
+                normalized.append(url)
+
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(normalized))
+
+    def _remember_uploaded_image_url(self, payload: dict):
+        """Cache upload response so image rendering can recover if live events omit file metadata."""
+        if not isinstance(payload, dict):
+            return
+
+        message_id = payload.get("message_id")
+        file_url = str(payload.get("file_url") or "").strip()
+        file_id = payload.get("file_id")
+
+        if not file_url and file_id is not None:
+            file_url = f"{self.server_url}/api/files/{file_id}"
+
+        if file_url.startswith("/"):
+            file_url = f"{self.server_url.rstrip('/')}{file_url}"
+        elif file_url and not file_url.lower().startswith(("http://", "https://")):
+            file_url = f"{self.server_url.rstrip('/')}/{file_url.lstrip('/')}"
+
+        if message_id not in (None, "") and file_url:
+            try:
+                self._uploaded_image_urls_by_message_id[int(message_id)] = file_url
+            except Exception:
+                pass
+
+    def _display_content_from_message(self, message: dict) -> str:
+        """Normalize API payload into displayable chat content."""
+        content = str(message.get("content", ""))
+        msg_type = str(message.get("message_type", "text"))
+
+        if msg_type != "image":
+            return content
+
+        file_url = str(message.get("file_url") or "").strip()
+        file_id = message.get("file_id")
+        message_id = message.get("id")
+
+        if not file_url and message_id not in (None, ""):
+            try:
+                file_url = self._uploaded_image_urls_by_message_id.get(int(message_id), "")
+            except Exception:
+                file_url = ""
+
+        if not file_url:
+            rel_match = re.search(r'(/api/files/\d+(?:\?[^\s]*)?)', content, re.IGNORECASE)
+            if rel_match:
+                file_url = f"{self.server_url.rstrip('/')}{rel_match.group(1)}"
+
+        if file_url and file_url.startswith("/"):
+            file_url = f"{self.server_url}{file_url}"
+        elif file_url and not file_url.lower().startswith(("http://", "https://")):
+            file_url = f"{self.server_url}/{file_url.lstrip('/')}"
+
+        if not file_url and file_id is not None:
+            file_url = f"{self.server_url}/api/files/{file_id}"
+
+        if file_url:
+            return f"[Image] {file_url}"
+        return content
 
     def _save_images_from_chat(self, folder_path: Optional[str] = None) -> tuple:
         """Save all image URLs from currently loaded chat messages to a local folder."""
@@ -1125,24 +1371,28 @@ class ChatWindow(QMainWindow):
         text_html = text_html.replace("\n", "<br>")
 
         # Preserve clickable non-image links inside text.
+        link_color = self._theme.get("link_color", "#7fb4ff")
         text_html = re.sub(
             r'(https?://[^\s<]+)',
-            r'<a href="\1" style="color:#7fb4ff;text-decoration:none;word-break:break-all;">\1</a>',
+            f'<a href="\\1" style="color:{link_color};text-decoration:none;word-break:break-all;">\\1</a>',
             text_html,
             flags=re.IGNORECASE,
         )
 
         images_html = []
+        image_w = int(self._theme.get("image_max_width", 420))
+        image_h = int(self._theme.get("image_max_height", 320))
+        image_r = int(self._theme.get("image_radius", 6))
         for url in image_urls:
             src = embedded_sources.get(url)
             if src:
                 images_html.append(
-                    f'<img src="{src}" style="max-width:420px;max-height:320px;'
-                    f'border-radius:6px;display:block;margin:8px 0;">'
+                    f'<img src="{src}" style="max-width:{image_w}px;max-height:{image_h}px;'
+                    f'border-radius:{image_r}px;display:block;margin:8px 0;">'
                 )
             else:
                 images_html.append(
-                    f'<a href="{url}" style="color:#7fb4ff;text-decoration:none;word-break:break-all;">{html.escape(url)}</a>'
+                    f'<a href="{url}" style="color:{link_color};text-decoration:none;word-break:break-all;">{html.escape(url)}</a>'
                 )
 
         if text_html and images_html:
@@ -1200,11 +1450,15 @@ class ChatWindow(QMainWindow):
         t = self._theme
         ff = t.get("font_family", "")
         fs = int(t.get("font_size", 13))
+        ts = int(t.get("timestamp_size", 11))
+        uw = int(t.get("username_weight", 700))
+        spacing = int(t.get("message_spacing", 4))
+        sys_italic = "italic" if bool(t.get("system_italic", True)) else "normal"
         font_style = (f"font-family:'{ff}';" if ff else "") + f"font-size:{fs}px;"
 
         if msg_type == "system":
             return (
-                f'<div style="margin:2px 0;color:{t["system_color"]};font-style:italic;{font_style}">'
+                f'<div style="margin:2px 0;color:{t["system_color"]};font-style:{sys_italic};{font_style}">'
                 f'[{timestamp}] [SYSTEM] {body_html}</div>'
             )
 
@@ -1212,11 +1466,12 @@ class ChatWindow(QMainWindow):
         align = "right" if is_self else "left"
         name_color = t["msg_own_name"] if is_self else t["msg_other_name"]
         text_color = t["msg_own_text"] if is_self else t["msg_other_text"]
+        timestamp_color = t.get("timestamp_color", t["system_color"])
 
         return (
-            f'<div style="text-align:{align};margin:4px 0;">'
-            f'<span style="color:{t["system_color"]};font-size:11px;">[{timestamp}] </span>'
-            f'<span style="color:{name_color};font-weight:700;">{username}</span><br>'
+            f'<div style="text-align:{align};margin:{spacing}px 0;">'
+            f'<span style="color:{timestamp_color};font-size:{ts}px;">[{timestamp}] </span>'
+            f'<span style="color:{name_color};font-weight:{uw};">{username}</span><br>'
             f'<span style="color:{text_color};{font_style}">{body_html}</span>'
             f'</div>'
         )
@@ -1385,8 +1640,8 @@ class ChatWindow(QMainWindow):
             for msg in deduped_messages:
                 self._seen_live_message_keys.add(self._message_event_key(msg))
                 username = msg.get("username", "Unknown")
-                content = msg.get("content", "")
                 msg_type = msg.get("message_type", "text")
+                content = self._display_content_from_message(msg)
                 self.append_chat_message(username, content, msg_type)
             self._update_members(result["members"])
             self.connect_websocket()
@@ -1408,8 +1663,8 @@ class ChatWindow(QMainWindow):
             for msg in deduped_messages:
                 self._seen_live_message_keys.add(self._message_event_key(msg))
                 username = msg.get("username", "Unknown")
-                content = msg.get("content", "")
                 msg_type = msg.get("message_type", "text")
+                content = self._display_content_from_message(msg)
                 self.append_chat_message(username, content, msg_type)
         self._run_in_bg(_fetch, _apply, self.current_room)
     
@@ -1524,7 +1779,7 @@ class ChatWindow(QMainWindow):
             "!stop - Stop the stream",
             "!status - Show stream status",
             "!addtags <tag1,tag2> - Add tags to saved pool",
-            "!removetags <tag1,tag2> - Remove tags from saved pool",
+            "!removetags <tag1,tag2|count> - Remove named tags or first N tags from taglist",
             "!taglist - Show saved tags",
             "!cleartags - Clear all saved tags",
             "!botcommands - Show this bot command list",
@@ -1567,7 +1822,7 @@ class ChatWindow(QMainWindow):
             if bang_action == "help":
                 self.append_system_message(
                     "Discord-style commands: !start <seconds> [tags] | !pause | !resume | !stop | !status | !commands | "
-                    "!addtags <tag1,tag2> | !removetags <tag1,tag2> | !taglist | !cleartags | !saveimages [folder_path]"
+                    "!addtags <tag1,tag2> | !removetags <tag1,tag2|count> | !taglist | !cleartags | !saveimages [folder_path]"
                 )
                 return
 
@@ -2124,7 +2379,7 @@ class ChatWindow(QMainWindow):
             self,
             "Select Image",
             "",
-            "Images (*.png *.jpg *.jpeg *.gif *.webp)"
+            "Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp)"
         )
         if file_path:
             room_id = self.current_room
@@ -2135,8 +2390,9 @@ class ChatWindow(QMainWindow):
             def _apply_upload(result):
                 success, payload = result if result else (False, "Upload failed")
                 if success:
+                    self._remember_uploaded_image_url(payload)
                     QMessageBox.information(self, "Success", "Image uploaded")
-                    if room_id == self.current_room and not (self.websocket_thread and self.websocket_thread.client):
+                    if room_id == self.current_room:
                         self.load_messages()
                 else:
                     QMessageBox.critical(self, "Error", f"Upload failed: {payload}")
@@ -2169,17 +2425,18 @@ class ChatWindow(QMainWindow):
     
     def on_message_received(self, data: dict):
         """Handle received message."""
+        event_room_id = data.get("room_id")
+        if event_room_id is not None and event_room_id != self.current_room:
+            return
+
         message_key = self._message_event_key(data)
         if message_key in self._seen_live_message_keys:
             return
         self._seen_live_message_keys.add(message_key)
 
         username = data.get("username", "Unknown")
-        content = data.get("content", "")
         msg_type = data.get("message_type", "text")
-
-        if msg_type == "image":
-            content = f"[Image] {data.get('file_url', '')}"
+        content = self._display_content_from_message(data)
 
         self.append_chat_message(username, content, msg_type)
         
@@ -2283,7 +2540,158 @@ class ChatWindow(QMainWindow):
         notif_widget.setLayout(notif_layout)
         tabs.addTab(notif_widget, "Notifications")
 
-        # ── Tab 2: Appearance ─────────────────────────────────────────────────
+        # ── Tab 2: Appearance (Basic) ───────────────────────────────────────
+        basic_widget = QWidget()
+        basic_layout = QVBoxLayout()
+
+        basic_preset_row = QHBoxLayout()
+        basic_preset_row.addWidget(QLabel("Quick preset:"))
+        basic_preset_combo = QComboBox()
+        basic_preset_combo.addItems(["Custom"] + list(_THEME_PRESETS.keys()))
+        basic_preset_row.addWidget(basic_preset_combo)
+        basic_apply_preset_btn = QPushButton("Apply")
+        basic_preset_row.addWidget(basic_apply_preset_btn)
+        basic_layout.addLayout(basic_preset_row)
+
+        basic_font_row = QHBoxLayout()
+        basic_font_row.addWidget(QLabel("Font:"))
+        basic_font_combo = QComboBox()
+        basic_available_fonts = sorted(QFontDatabase.families())
+        basic_font_combo.addItems(["(default)"] + basic_available_fonts)
+        current_basic_ff = self._theme.get("font_family", "")
+        basic_font_combo.setCurrentText(current_basic_ff if current_basic_ff else "(default)")
+        basic_font_row.addWidget(basic_font_combo)
+        basic_layout.addLayout(basic_font_row)
+
+        basic_size_row = QHBoxLayout()
+        basic_size_row.addWidget(QLabel("Font size:"))
+        basic_size_spin = QSpinBox()
+        basic_size_spin.setRange(8, 36)
+        basic_size_spin.setValue(int(self._theme.get("font_size", 13)))
+        basic_size_row.addWidget(basic_size_spin)
+        basic_layout.addLayout(basic_size_row)
+
+        basic_color_buttons: Dict[str, tuple] = {}
+
+        def _sync_basic_controls_from_theme():
+            ff_basic = self._theme.get("font_family", "")
+            if ff_basic and basic_font_combo.findText(ff_basic) == -1:
+                basic_font_combo.addItem(ff_basic)
+            basic_font_combo.setCurrentText(ff_basic if ff_basic else "(default)")
+            basic_size_spin.setValue(int(self._theme.get("font_size", 13)))
+
+            for k, (sw, cl) in basic_color_buttons.items():
+                val = self._theme.get(k, "#ffffff")
+                sw.setStyleSheet(
+                    f"background-color:{val};border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
+                )
+                cl.setText(val)
+
+        def _make_basic_color_row(theme_key: str, label: str):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            swatch = QPushButton()
+            swatch.setFixedSize(24, 24)
+            color_label = QLabel(self._theme.get(theme_key, "#ffffff"))
+
+            def _refresh_swatch():
+                val = self._theme.get(theme_key, "#ffffff")
+                swatch.setStyleSheet(
+                    f"background-color:{val};border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
+                )
+                color_label.setText(val)
+
+            def _pick():
+                from PyQt6.QtGui import QColor
+                chosen = QColorDialog.getColor(QColor(self._theme.get(theme_key, "#ffffff")), dialog, f"Pick {label}")
+                if chosen.isValid():
+                    self._theme[theme_key] = chosen.name()
+                    _refresh_swatch()
+                    self._apply_theme()
+
+            swatch.clicked.connect(_pick)
+            _refresh_swatch()
+            row.addWidget(swatch)
+            row.addWidget(color_label)
+            row.addStretch()
+            basic_layout.addLayout(row)
+            basic_color_buttons[theme_key] = (swatch, color_label)
+
+        _make_basic_color_row("window_bg", "Window background:")
+        _make_basic_color_row("header_bg", "Header background:")
+        _make_basic_color_row("panel_bg", "Panel background:")
+        _make_basic_color_row("chat_bg", "Chat background:")
+        _make_basic_color_row("input_bg", "Input background:")
+        _make_basic_color_row("text_color", "Text colour:")
+        _make_basic_color_row("button_bg", "Button background:")
+
+        def _theme_from_preset_name(name: str) -> Dict:
+            preset_data = _THEME_PRESETS.get(name, {})
+            merged = {**_THEME_DEFAULTS, **preset_data}
+
+            # Fill omitted visual keys so preset changes propagate everywhere.
+            if "header_bg" not in preset_data:
+                merged["header_bg"] = merged.get("window_bg", _THEME_DEFAULTS["window_bg"])
+            if "chat_bg" not in preset_data:
+                merged["chat_bg"] = merged.get("panel_bg", _THEME_DEFAULTS["panel_bg"])
+            if "input_bg" not in preset_data:
+                merged["input_bg"] = merged.get("panel_bg", _THEME_DEFAULTS["panel_bg"])
+            if "button_text" not in preset_data:
+                merged["button_text"] = merged.get("text_color", _THEME_DEFAULTS["text_color"])
+            if "timestamp_color" not in preset_data:
+                merged["timestamp_color"] = merged.get("system_color", _THEME_DEFAULTS["system_color"])
+            if "link_color" not in preset_data:
+                merged["link_color"] = merged.get("msg_other_name", _THEME_DEFAULTS["link_color"])
+            if "msg_own_text" not in preset_data:
+                merged["msg_own_text"] = merged.get("text_color", _THEME_DEFAULTS["msg_own_text"])
+            if "msg_other_text" not in preset_data:
+                merged["msg_other_text"] = merged.get("text_color", _THEME_DEFAULTS["msg_other_text"])
+            if "system_color" not in preset_data:
+                merged["system_color"] = merged.get("text_color", _THEME_DEFAULTS["system_color"])
+
+            return self._sanitize_theme(merged)
+
+        basic_btn_row = QHBoxLayout()
+        basic_apply_save_btn = QPushButton("Apply && Save")
+        basic_reset_btn = QPushButton("Reset")
+        basic_btn_row.addWidget(basic_apply_save_btn)
+        basic_btn_row.addWidget(basic_reset_btn)
+        basic_layout.addLayout(basic_btn_row)
+        basic_layout.addStretch()
+
+        def _apply_basic_preset():
+            name = basic_preset_combo.currentText()
+            if name == "Custom":
+                return
+            self._theme = _theme_from_preset_name(name)
+            _sync_basic_controls_from_theme()
+            self._apply_theme()
+
+        def _apply_basic_and_save():
+            ff = basic_font_combo.currentText()
+            if ff != "(default)" and ff not in set(basic_available_fonts):
+                ff = "(default)"
+                basic_font_combo.setCurrentText("(default)")
+            self._theme["font_family"] = "" if ff == "(default)" else ff
+            self._theme["font_size"] = basic_size_spin.value()
+            self._theme = self._sanitize_theme(self._theme)
+            self._apply_theme()
+            self._save_user_settings()
+            self.load_messages()
+
+        def _reset_basic():
+            self._theme = copy.deepcopy(_THEME_DEFAULTS)
+            _sync_basic_controls_from_theme()
+            self._apply_theme()
+
+        basic_apply_preset_btn.clicked.connect(_apply_basic_preset)
+        basic_apply_save_btn.clicked.connect(_apply_basic_and_save)
+        basic_reset_btn.clicked.connect(_reset_basic)
+
+        basic_widget.setLayout(basic_layout)
+        tabs.addTab(basic_widget, "Appearance")
+
+        # ── Tab 3: Appearance (Advanced) ─────────────────────────────────────
         app_scroll = QScrollArea()
         app_scroll.setWidgetResizable(True)
         app_inner = QWidget()
@@ -2294,7 +2702,7 @@ class ChatWindow(QMainWindow):
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Theme preset:"))
         preset_combo = QComboBox()
-        preset_combo.addItems(["Custom", "Dark (Default)", "PowerShell", "Light", "Midnight Blue", "Forest Green"])
+        preset_combo.addItems(["Custom"] + list(_THEME_PRESETS.keys()))
         preset_row.addWidget(preset_combo)
         apply_preset_btn = QPushButton("Apply Preset")
         preset_row.addWidget(apply_preset_btn)
@@ -2304,11 +2712,16 @@ class ChatWindow(QMainWindow):
         color_settings = [
             ("window_bg",      "Window background"),
             ("panel_bg",       "Panel / widget background"),
+            ("header_bg",      "Header background"),
+            ("chat_bg",        "Chat area background"),
+            ("input_bg",       "Input background"),
             ("border_color",   "Border / separator"),
             ("text_color",     "Main text"),
             ("button_bg",      "Button background"),
             ("button_border",  "Button border"),
             ("button_text",    "Button text"),
+            ("timestamp_color", "Timestamp colour"),
+            ("link_color",     "Link colour"),
             ("msg_own_name",   "Your username colour"),
             ("msg_other_name", "Other username colour"),
             ("msg_own_text",   "Your message text"),
@@ -2346,6 +2759,7 @@ class ChatWindow(QMainWindow):
                             f"border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
                         )
                         cl.setText(hex_val)
+                        self._apply_theme()
                 return _click
 
             swatch.clicked.connect(_make_clicker(key, swatch, color_label))
@@ -2359,9 +2773,20 @@ class ChatWindow(QMainWindow):
         font_row = QHBoxLayout()
         font_row.addWidget(QLabel("Font family:"))
         font_combo = QComboBox()
-        font_combo.addItems(["(default)", "Consolas", "Courier New", "Segoe UI", "Arial",
-                             "Verdana", "Calibri", "Tahoma", "Lucida Console", "Cascadia Code"])
+        available_fonts = set(QFontDatabase.families())
+        preferred_fonts = [
+            "Consolas", "Cascadia Code", "Courier New", "Lucida Console", "OCR A Extended",
+            "Segoe UI", "Arial", "Verdana", "Calibri", "Tahoma", "Trebuchet MS",
+            "Georgia", "Times New Roman", "Palatino Linotype", "Lucida Handwriting",
+            "Comic Sans MS", "Papyrus", "Impact", "Jokerman", "Chiller", "Stencil",
+            "Webdings", "Wingdings"
+        ]
+        ordered_fonts = [font for font in preferred_fonts if font in available_fonts]
+        ordered_fonts.extend(sorted(font for font in available_fonts if font not in set(ordered_fonts)))
+        font_combo.addItems(["(default)"] + ordered_fonts)
         current_ff = self._theme.get("font_family", "")
+        if current_ff and current_ff not in ordered_fonts:
+            font_combo.addItem(current_ff)
         font_combo.setCurrentText(current_ff if current_ff else "(default)")
         font_row.addWidget(font_combo)
         font_row.addStretch()
@@ -2377,45 +2802,193 @@ class ChatWindow(QMainWindow):
         size_row.addStretch()
         app_layout.addLayout(size_row)
 
+        # Extra style controls
+        weight_row = QHBoxLayout()
+        weight_row.addWidget(QLabel("Font weight:"))
+        weight_spin = QSpinBox()
+        weight_spin.setRange(100, 900)
+        weight_spin.setSingleStep(100)
+        weight_spin.setValue(int(self._theme.get("font_weight", 600)))
+        weight_row.addWidget(weight_spin)
+        weight_row.addStretch()
+        app_layout.addLayout(weight_row)
+
+        radius_row = QHBoxLayout()
+        radius_row.addWidget(QLabel("Widget corner radius:"))
+        widget_radius_spin = QSpinBox()
+        widget_radius_spin.setRange(0, 24)
+        widget_radius_spin.setValue(int(self._theme.get("widget_radius", 8)))
+        radius_row.addWidget(widget_radius_spin)
+        radius_row.addStretch()
+        app_layout.addLayout(radius_row)
+
+        button_radius_row = QHBoxLayout()
+        button_radius_row.addWidget(QLabel("Button corner radius:"))
+        button_radius_spin = QSpinBox()
+        button_radius_spin.setRange(0, 24)
+        button_radius_spin.setValue(int(self._theme.get("button_radius", 8)))
+        button_radius_row.addWidget(button_radius_spin)
+        button_radius_row.addStretch()
+        app_layout.addLayout(button_radius_row)
+
+        border_row = QHBoxLayout()
+        border_row.addWidget(QLabel("Border width:"))
+        border_width_spin = QSpinBox()
+        border_width_spin.setRange(1, 4)
+        border_width_spin.setValue(int(self._theme.get("border_width", 1)))
+        border_row.addWidget(border_width_spin)
+        border_row.addStretch()
+        app_layout.addLayout(border_row)
+
+        timestamp_row = QHBoxLayout()
+        timestamp_row.addWidget(QLabel("Timestamp size (px):"))
+        timestamp_spin = QSpinBox()
+        timestamp_spin.setRange(8, 22)
+        timestamp_spin.setValue(int(self._theme.get("timestamp_size", 11)))
+        timestamp_row.addWidget(timestamp_spin)
+        timestamp_row.addStretch()
+        app_layout.addLayout(timestamp_row)
+
+        name_weight_row = QHBoxLayout()
+        name_weight_row.addWidget(QLabel("Username weight:"))
+        name_weight_spin = QSpinBox()
+        name_weight_spin.setRange(100, 900)
+        name_weight_spin.setSingleStep(100)
+        name_weight_spin.setValue(int(self._theme.get("username_weight", 700)))
+        name_weight_row.addWidget(name_weight_spin)
+        name_weight_row.addStretch()
+        app_layout.addLayout(name_weight_row)
+
+        spacing_row = QHBoxLayout()
+        spacing_row.addWidget(QLabel("Message spacing:"))
+        message_spacing_spin = QSpinBox()
+        message_spacing_spin.setRange(0, 20)
+        message_spacing_spin.setValue(int(self._theme.get("message_spacing", 4)))
+        spacing_row.addWidget(message_spacing_spin)
+        spacing_row.addStretch()
+        app_layout.addLayout(spacing_row)
+
+        italic_row = QHBoxLayout()
+        system_italic_chk = QCheckBox("Italic system messages")
+        system_italic_chk.setChecked(bool(self._theme.get("system_italic", True)))
+        italic_row.addWidget(system_italic_chk)
+        italic_row.addStretch()
+        app_layout.addLayout(italic_row)
+
+        imgw_row = QHBoxLayout()
+        imgw_row.addWidget(QLabel("Image max width (px):"))
+        image_width_spin = QSpinBox()
+        image_width_spin.setRange(120, 1600)
+        image_width_spin.setValue(int(self._theme.get("image_max_width", 420)))
+        imgw_row.addWidget(image_width_spin)
+        imgw_row.addStretch()
+        app_layout.addLayout(imgw_row)
+
+        imgh_row = QHBoxLayout()
+        imgh_row.addWidget(QLabel("Image max height (px):"))
+        image_height_spin = QSpinBox()
+        image_height_spin.setRange(120, 1200)
+        image_height_spin.setValue(int(self._theme.get("image_max_height", 320)))
+        imgh_row.addWidget(image_height_spin)
+        imgh_row.addStretch()
+        app_layout.addLayout(imgh_row)
+
+        imgr_row = QHBoxLayout()
+        imgr_row.addWidget(QLabel("Image corner radius:"))
+        image_radius_spin = QSpinBox()
+        image_radius_spin.setRange(0, 24)
+        image_radius_spin.setValue(int(self._theme.get("image_radius", 6)))
+        imgr_row.addWidget(image_radius_spin)
+        imgr_row.addStretch()
+        app_layout.addLayout(imgr_row)
+
+        split_row = QHBoxLayout()
+        split_row.addWidget(QLabel("Splitter handle size:"))
+        splitter_size_spin = QSpinBox()
+        splitter_size_spin.setRange(4, 24)
+        splitter_size_spin.setValue(int(self._theme.get("splitter_handle_size", 8)))
+        split_row.addWidget(splitter_size_spin)
+        split_row.addStretch()
+        app_layout.addLayout(split_row)
+
         # Apply / Reset buttons
         btn_row = QHBoxLayout()
         apply_theme_btn = QPushButton("Apply && Save")
         reset_theme_btn = QPushButton("Reset to Default")
+        export_theme_btn = QPushButton("Export Theme")
+        import_theme_btn = QPushButton("Import Theme")
+        edit_json_btn = QPushButton("Advanced JSON")
         btn_row.addWidget(apply_theme_btn)
         btn_row.addWidget(reset_theme_btn)
+        btn_row.addWidget(export_theme_btn)
+        btn_row.addWidget(import_theme_btn)
+        btn_row.addWidget(edit_json_btn)
         app_layout.addLayout(btn_row)
         app_layout.addStretch()
 
         app_inner.setLayout(app_layout)
         app_scroll.setWidget(app_inner)
-        tabs.addTab(app_scroll, "Appearance")
+        tabs.addTab(app_scroll, "Appearance (Advanced)")
+
+        def _sync_controls_from_theme():
+            _sync_basic_controls_from_theme()
+            ff2 = self._theme.get("font_family", "")
+            font_combo.setCurrentText(ff2 if ff2 else "(default)")
+            size_spin.setValue(int(self._theme.get("font_size", 13)))
+            weight_spin.setValue(int(self._theme.get("font_weight", 600)))
+            widget_radius_spin.setValue(int(self._theme.get("widget_radius", 8)))
+            button_radius_spin.setValue(int(self._theme.get("button_radius", 8)))
+            border_width_spin.setValue(int(self._theme.get("border_width", 1)))
+            timestamp_spin.setValue(int(self._theme.get("timestamp_size", 11)))
+            name_weight_spin.setValue(int(self._theme.get("username_weight", 700)))
+            message_spacing_spin.setValue(int(self._theme.get("message_spacing", 4)))
+            system_italic_chk.setChecked(bool(self._theme.get("system_italic", True)))
+            image_width_spin.setValue(int(self._theme.get("image_max_width", 420)))
+            image_height_spin.setValue(int(self._theme.get("image_max_height", 320)))
+            image_radius_spin.setValue(int(self._theme.get("image_radius", 6)))
+            splitter_size_spin.setValue(int(self._theme.get("splitter_handle_size", 8)))
+
+            for key, (sw, cl) in color_buttons.items():
+                cv = self._theme.get(key, "#ffffff")
+                sw.setStyleSheet(
+                    f"background-color:{cv};"
+                    f"border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
+                )
+                cl.setText(cv)
 
         # ── Wire preset selector ──────────────────────────────────────────────
         def _apply_preset():
             name = preset_combo.currentText()
             if name == "Custom":
                 return
-            preset_data = _THEME_PRESETS.get(name, {})
-            for k, v in preset_data.items():
-                self._theme[k] = v
-            ff2 = self._theme.get("font_family", "")
-            font_combo.setCurrentText(ff2 if ff2 else "(default)")
-            size_spin.setValue(int(self._theme.get("font_size", 13)))
-            for k2, (sw2, cl2) in color_buttons.items():
-                cv = self._theme.get(k2, "#ffffff")
-                sw2.setStyleSheet(
-                    f"background-color:{cv};"
-                    f"border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
-                )
-                cl2.setText(cv)
+            self._theme = _theme_from_preset_name(name)
+            _sync_controls_from_theme()
+            self._apply_theme()
 
         apply_preset_btn.clicked.connect(_apply_preset)
 
         # ── Wire apply & save ─────────────────────────────────────────────────
         def _apply_and_save():
             ff3 = font_combo.currentText()
+            if ff3 != "(default)" and ff3 not in available_fonts:
+                QMessageBox.warning(dialog, "Font not available", f"The font '{ff3}' is not installed. Using default font.")
+                ff3 = "(default)"
+                font_combo.setCurrentText("(default)")
             self._theme["font_family"] = "" if ff3 == "(default)" else ff3
             self._theme["font_size"] = size_spin.value()
+            self._theme["font_weight"] = weight_spin.value()
+            self._theme["widget_radius"] = widget_radius_spin.value()
+            self._theme["button_radius"] = button_radius_spin.value()
+            self._theme["border_width"] = border_width_spin.value()
+            self._theme["timestamp_size"] = timestamp_spin.value()
+            self._theme["username_weight"] = name_weight_spin.value()
+            self._theme["message_spacing"] = message_spacing_spin.value()
+            self._theme["system_italic"] = system_italic_chk.isChecked()
+            self._theme["image_max_width"] = image_width_spin.value()
+            self._theme["image_max_height"] = image_height_spin.value()
+            self._theme["image_radius"] = image_radius_spin.value()
+            self._theme["splitter_handle_size"] = splitter_size_spin.value()
+            self._theme = self._sanitize_theme(self._theme)
             self._apply_theme()
             self._save_user_settings()
             self.load_messages()
@@ -2425,17 +2998,67 @@ class ChatWindow(QMainWindow):
         # ── Wire reset ────────────────────────────────────────────────────────
         def _reset_defaults():
             self._theme = copy.deepcopy(_THEME_DEFAULTS)
-            font_combo.setCurrentText("(default)")
-            size_spin.setValue(13)
-            for k3, (sw3, cl3) in color_buttons.items():
-                cv2 = self._theme.get(k3, "#ffffff")
-                sw3.setStyleSheet(
-                    f"background-color:{cv2};"
-                    f"border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
-                )
-                cl3.setText(cv2)
+            _sync_controls_from_theme()
+            self._apply_theme()
 
         reset_theme_btn.clicked.connect(_reset_defaults)
+
+        def _export_theme():
+            path, _ = QFileDialog.getSaveFileName(dialog, "Export Theme", "theme.json", "JSON Files (*.json)")
+            if not path:
+                return
+            try:
+                Path(path).write_text(json.dumps(self._sanitize_theme(self._theme), indent=2), encoding="utf-8")
+                self.append_system_message(f"Theme exported: {path}")
+            except Exception as e:
+                QMessageBox.critical(dialog, "Export failed", str(e))
+
+        def _import_theme():
+            path, _ = QFileDialog.getOpenFileName(dialog, "Import Theme", "", "JSON Files (*.json)")
+            if not path:
+                return
+            try:
+                incoming = json.loads(Path(path).read_text(encoding="utf-8"))
+                self._theme = self._sanitize_theme(incoming)
+                _sync_controls_from_theme()
+                self._apply_theme()
+            except Exception as e:
+                QMessageBox.critical(dialog, "Import failed", str(e))
+
+        def _edit_theme_json():
+            editor = QDialog(dialog)
+            editor.setWindowTitle("Advanced Theme JSON")
+            editor.setMinimumSize(640, 500)
+            editor_layout = QVBoxLayout()
+            text = QTextEdit()
+            text.setPlainText(json.dumps(self._sanitize_theme(self._theme), indent=2))
+            editor_layout.addWidget(text)
+            btns = QHBoxLayout()
+            apply_btn = QPushButton("Apply JSON")
+            close_btn2 = QPushButton("Close")
+            btns.addWidget(apply_btn)
+            btns.addWidget(close_btn2)
+            editor_layout.addLayout(btns)
+            editor.setLayout(editor_layout)
+
+            def _apply_json_text():
+                try:
+                    incoming = json.loads(text.toPlainText())
+                    self._theme = self._sanitize_theme(incoming)
+                    _sync_controls_from_theme()
+                    self._apply_theme()
+                except Exception as e:
+                    QMessageBox.critical(editor, "Invalid JSON", str(e))
+
+            apply_btn.clicked.connect(_apply_json_text)
+            close_btn2.clicked.connect(editor.accept)
+            editor.exec()
+
+        export_theme_btn.clicked.connect(_export_theme)
+        import_theme_btn.clicked.connect(_import_theme)
+        edit_json_btn.clicked.connect(_edit_theme_json)
+
+        _sync_controls_from_theme()
 
         outer.addWidget(tabs)
         close_btn = QPushButton("Close")
@@ -2459,10 +3082,7 @@ class ChatWindow(QMainWindow):
             self.notification_handler.set_custom_sound(custom_sound)
 
             saved_theme = data.get("theme")
-            if isinstance(saved_theme, dict):
-                for k, v in saved_theme.items():
-                    if k in _THEME_DEFAULTS:
-                        self._theme[k] = v
+            self._theme = self._sanitize_theme(saved_theme)
         except Exception:
             pass
 
@@ -2472,7 +3092,7 @@ class ChatWindow(QMainWindow):
             payload = {
                 "sound_enabled": self.notification_handler.sound_enabled,
                 "custom_sound_path": self.notification_handler.custom_sound_path,
-                "theme": self._theme,
+                "theme": self._sanitize_theme(self._theme),
             }
             self.settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception:
@@ -2517,10 +3137,13 @@ class ChatWindow(QMainWindow):
         """Handle window close."""
         if self.current_room:
             # Best effort to announce offline state when app closes.
-            self.api_client.leave_room(self.current_room)
+            room_id = self.current_room
+            threading.Thread(target=lambda: self.api_client.leave_room(room_id), daemon=True).start()
         if self.websocket_thread:
             self.websocket_thread.stop()
+            self.websocket_thread.wait(1500)
         self.room_refresh_thread.stop()
+        self.room_refresh_thread.wait(1500)
         super().closeEvent(event)
 
 

@@ -3,7 +3,7 @@ Main FastAPI server for encrypted chat application.
 Includes REST API endpoints and WebSocket real-time messaging.
 """
 
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, File, UploadFile, Query, Header
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, File, UploadFile, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -12,6 +12,7 @@ from typing import List, Optional, Dict
 import os
 import shutil
 import random
+import mimetypes
 from pathlib import Path
 from contextlib import suppress
 
@@ -725,6 +726,7 @@ async def get_messages(
     room_id: int,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    request: Request = None,
     authorization: str = Header(None),
     db: Session = Depends(get_db)
 ):
@@ -754,17 +756,28 @@ async def get_messages(
     ).order_by(Message.created_at.desc()).offset(offset).limit(limit).all()
     
     result = []
+    base_url = str(request.base_url).rstrip("/") if request else ""
     for msg in reversed(messages):  # Reverse to get chronological order
         try:
             decrypted = encryption_manager.decrypt_message(room_id, msg.content)
-            result.append({
+            payload = {
                 "id": msg.id,
                 "user_id": msg.user_id,
                 "username": msg.user.username,
                 "content": decrypted,
                 "message_type": msg.message_type,
                 "created_at": msg.created_at
-            })
+            }
+
+            if msg.message_type == "image" and msg.files:
+                file_obj = msg.files[0]
+                payload["file_id"] = file_obj.id
+                if base_url:
+                    payload["file_url"] = f"{base_url}/api/files/{file_obj.id}"
+                else:
+                    payload["file_url"] = f"/api/files/{file_obj.id}"
+
+            result.append(payload)
         except:
             # Skip messages that can't be decrypted
             pass
@@ -876,6 +889,7 @@ async def clear_room_messages(
 async def upload_file(
     room_id: int,
     file: UploadFile = File(...),
+    request: Request = None,
     authorization: str = Header(None),
     db: Session = Depends(get_db)
 ):
@@ -887,14 +901,51 @@ async def upload_file(
     user, error = auth_manager.verify_token(db, token)
     if error:
         raise HTTPException(status_code=401, detail=error)
+
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    member = db.query(RoomMember).filter(
+        RoomMember.user_id == user.id,
+        RoomMember.room_id == room_id
+    ).first()
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this room")
     
     # Validate file type
-    allowed_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
-    if file.content_type not in allowed_types:
+    allowed_types = {
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+    }
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+    file_extension = Path(file.filename or "").suffix.lower()
+    normalized_content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    guessed_content_type = (mimetypes.guess_type(file.filename or "")[0] or "").lower()
+
+    if (
+        normalized_content_type not in allowed_types
+        and guessed_content_type not in allowed_types
+        and file_extension not in allowed_extensions
+    ):
         raise HTTPException(status_code=400, detail="Only image files are allowed")
+
+    effective_content_type = normalized_content_type or guessed_content_type
+    if effective_content_type not in allowed_types:
+        effective_content_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".bmp": "image/bmp",
+        }.get(file_extension, "image/jpeg")
     
     # Save file
-    file_extension = Path(file.filename).suffix
     unique_filename = f"{user.id}_{datetime.utcnow().timestamp()}{file_extension}"
     file_path = UPLOAD_DIR / unique_filename
     
@@ -919,18 +970,25 @@ async def upload_file(
         filename=file.filename,
         file_path=str(file_path),
         file_size=len(content),
-        file_type=file.content_type
+        file_type=effective_content_type
     )
     db.add(db_file)
     db.commit()
     
+    file_url = f"/api/files/{db_file.id}"
+    if request:
+        file_url = f"{str(request.base_url).rstrip('/')}/api/files/{db_file.id}"
+
     await manager.broadcast(room_id, {
         "type": "message_new",
         "id": message.id,
         "user_id": user.id,
+        "room_id": room_id,
         "username": user.username,
         "content": "[Image]",
         "message_type": "image",
+        "file_id": db_file.id,
+        "file_url": file_url,
         "created_at": message.created_at.isoformat()
     })
     
