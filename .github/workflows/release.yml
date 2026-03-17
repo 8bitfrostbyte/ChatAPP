@@ -1,0 +1,72 @@
+name: Build And Release EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (for manual runs, e.g. v1.0.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Release Tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ github.event.inputs.tag }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+          if (-not $tag.StartsWith("v")) {
+            throw "Tag must start with 'v' (example: v1.0.2)"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Client Dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r encrypted-chat-app/client/requirements.txt
+          pip install pyinstaller
+
+      - name: Build EncryptedChat.exe
+        shell: pwsh
+        run: |
+          pyinstaller encrypted-chat-app/client/EncryptedChat.spec --noconfirm --clean
+
+      - name: Verify EXE Exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "encrypted-chat-app/client/dist/EncryptedChat.exe")) {
+            throw "Build did not produce encrypted-chat-app/client/dist/EncryptedChat.exe"
+          }
+
+      - name: Create Or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Version ${{ steps.tag.outputs.tag }}
+          files: encrypted-chat-app/client/dist/EncryptedChat.exe
+          make_latest: true
+          generate_release_notes: true
