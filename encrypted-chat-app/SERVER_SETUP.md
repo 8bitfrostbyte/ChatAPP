@@ -6,6 +6,7 @@
 - **Linux Debian Server** (or Ubuntu)
 - **pip** and **venv** for Python package management
 - **OpenSSL** for HTTPS certificates (optional but recommended)
+- **Build tools** for some Python packages on newer distros: `build-essential`, `libffi-dev`, `libssl-dev`, `rustc`, `cargo`
 
 ## Step 1: Install Python and Dependencies
 
@@ -15,7 +16,7 @@ sudo apt-get update
 sudo apt-get upgrade -y
 
 # Install Python and required system packages
-sudo apt-get install -y python3 python3-pip python3-venv git curl
+sudo apt-get install -y python3 python3-pip python3-venv git curl wget build-essential libffi-dev libssl-dev rustc cargo
 
 # Verify Python installation
 python3 --version
@@ -36,6 +37,18 @@ source venv/bin/activate
 
 # Install Python dependencies
 pip install -r server/requirements.txt
+
+# If your server uses Python 3.13, use this compatibility file instead
+cd server
+cp -f requirements.txt requirements.linux.txt
+sed -i 's/uvicorn\[standard\]==0.24.0/uvicorn==0.24.0/' requirements.linux.txt
+sed -i 's/curl-cffi==0.5.9/curl-cffi>=0.7.4/' requirements.linux.txt
+sed -i 's/pillow==10.1.0/pillow>=11.0.0/' requirements.linux.txt
+sed -i 's/pydantic==2.5.0/pydantic>=2.10.6,<3/' requirements.linux.txt
+sed -i 's/pydantic-settings==2.1.0/pydantic-settings>=2.6.1,<3/' requirements.linux.txt
+sed -i 's/^sqlalchemy==2.0.23$/sqlalchemy>=2.0.40,<2.1/' requirements.linux.txt
+cd ..
+pip install --only-binary=:all: -r server/requirements.linux.txt
 ```
 
 ## Step 3: Configure Environment Variables
@@ -125,6 +138,12 @@ sudo systemctl start encrypted-chat
 sudo systemctl status encrypted-chat
 ```
 
+If your app path is `/home/frostbyte/ChatAPP/encrypted-chat-app`, use this exact service file values:
+
+- `User=frostbyte`
+- `WorkingDirectory=/home/frostbyte/ChatAPP/encrypted-chat-app/server`
+- `ExecStart=/home/frostbyte/ChatAPP/encrypted-chat-app/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000`
+
 ## Step 6: Setup HTTPS (Optional but Recommended)
 
 ### Using Let's Encrypt (Free SSL)
@@ -200,6 +219,17 @@ cloudflared tunnel route dns encrypted-chat chat.your-domain.com
 # Run the tunnel
 cloudflared tunnel run encrypted-chat
 ```
+
+Important dashboard note: for public websites/apps, add routes under `Published application routes`.
+Do not use `Hostname routes` for this use case (that is private routing/WARP flow).
+
+For two apps on the same server, use one healthy tunnel with multiple hostname routes:
+
+- `chat.frostchat.uk` -> `http://localhost:8000` (encrypted chat)
+- `8bitfrostbyte.win` -> `http://localhost:8096` (other app)
+
+If cloudflared is already installed as a service, do not install a second one.
+Just keep one `cloudflared` service running and manage both hostnames in the tunnel dashboard.
 
 Create systemd service for tunnel:
 
@@ -288,6 +318,12 @@ curl http://localhost:8000/api/rooms
 - Kill existing process: `sudo kill -9 <PID>`
 - Check logs for errors
 
+Common startup fixes:
+
+- `status=203/EXEC`: your `ExecStart` path is wrong in `/etc/systemd/system/encrypted-chat.service`.
+- `ImportError: cannot import name PBKDF2...`: in `server/encryption.py`, use `PBKDF2HMAC`.
+- If manual run works but service fails, run `sudo systemctl daemon-reload` then restart service.
+
 ### Database errors
 - Delete old database: `rm chat_app.db`
 - Reinitialize: `python3 -c "from database import init_db; init_db()"`
@@ -370,6 +406,17 @@ htop
 
 # Check disk space
 df -h
+```
+
+Additional useful checks:
+
+```bash
+# Confirm app endpoint locally
+curl http://localhost:8000/health
+
+# Confirm cloudflared is connected
+sudo systemctl status cloudflared --no-pager -l
+sudo journalctl -u cloudflared -n 80 --no-pager
 ```
 
 ## Next Steps
