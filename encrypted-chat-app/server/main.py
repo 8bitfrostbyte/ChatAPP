@@ -1102,7 +1102,8 @@ async def get_messages(
     ).order_by(Message.created_at.desc()).offset(offset).limit(limit).all()
     
     result = []
-    base_url = str(request.base_url).rstrip("/") if request else ""
+    # Always use request.base_url for file_url if possible
+    base_url = str(request.base_url).rstrip("/") if request and hasattr(request, "base_url") else None
     for msg in reversed(messages):  # Reverse to get chronological order
         try:
             decrypted = encryption_manager.decrypt_message(room_id, msg.content)
@@ -1124,13 +1125,16 @@ async def get_messages(
                 if base_url:
                     payload["file_url"] = f"{base_url}/api/files/{file_obj.id}"
                 else:
-                    payload["file_url"] = f"/api/files/{file_obj.id}"
+                    # Fallback: try to build absolute URL from config or environment
+                    from os import environ
+                    host = environ.get("SERVER_HOST", "localhost")
+                    port = environ.get("SERVER_PORT", "8000")
+                    payload["file_url"] = f"http://{host}:{port}/api/files/{file_obj.id}"
 
             result.append(payload)
-        except:
+        except Exception as e:
             # Skip messages that can't be decrypted
             pass
-    
     return result
 
 

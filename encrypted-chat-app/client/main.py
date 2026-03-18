@@ -2022,7 +2022,14 @@ class ChatWindow(QMainWindow):
             "attachment": attachment,
         })
 
-        image_urls = self._extract_image_urls(content)
+        # Collect image URLs from both message content and attachment
+        image_urls = set(self._extract_image_urls(content))
+        if attachment and attachment.get("file_url"):
+            file_url = attachment["file_url"]
+            file_type = (attachment.get("file_type") or "").lower()
+            # Only treat as image if file_type is image/* or file extension is image-like
+            if file_type.startswith("image/") or any(file_url.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]):
+                image_urls.add(file_url)
 
         if msg_type != "system" and image_urls:
             # Show placeholder immediately (preserves message order), then rebuild once image is cached.
@@ -2041,7 +2048,7 @@ class ChatWindow(QMainWindow):
                 if any_loaded:
                     self._schedule_chat_rebuild()
 
-            self._run_in_bg(_fetch_embeds, _apply, content, image_urls)
+            self._run_in_bg(_fetch_embeds, _apply, content, list(image_urls))
             return
 
         body_html = self._build_message_body_html(content, {})
