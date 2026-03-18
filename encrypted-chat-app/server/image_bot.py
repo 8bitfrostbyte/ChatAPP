@@ -325,10 +325,11 @@ class ImageBot:
                 params["api_key"] = self.config.rule34_api_key
 
             try:
-                response = requests.get(
+                response = curi_requests.get(
                     "https://api.rule34.xxx",
                     params=params,
                     headers=self.config.headers,
+                    impersonate="chrome110",
                     timeout=10,
                 )
                 if response.status_code != 200:
@@ -477,10 +478,11 @@ class ImageBot:
                 params["api_key"] = self.config.rule34_api_key
 
             try:
-                response = requests.get(
+                response = curi_requests.get(
                     "https://api.rule34.xxx",
                     params=params,
                     headers=self.config.headers,
+                    impersonate="chrome110",
                     timeout=12,
                 )
                 if response.status_code != 200:
@@ -528,10 +530,11 @@ class ImageBot:
             params["api_key"] = self.config.rule34_api_key
 
         try:
-            response = requests.get(
+            response = curi_requests.get(
                 "https://api.rule34.xxx",
                 params=params,
                 headers=self.config.headers,
+                impersonate="chrome110",
                 timeout=12,
             )
             if response.status_code != 200:
@@ -667,20 +670,30 @@ class ImageBot:
                     params["user_id"] = self.config.rule34_user_id
                     params["api_key"] = self.config.rule34_api_key
 
-                response = requests.get(
+                response = curi_requests.get(
                     "https://api.rule34.xxx",
                     params=params,
                     headers=self.config.headers,
+                    impersonate="chrome110",
                     timeout=15,
                 )
                 if response.status_code != 200:
                     log_info(f"ImageBot: Rule34 HTTP {response.status_code} for tag='{query_tag}' pid={pid}")
                     continue
 
-                data = response.json()
+                try:
+                    data = response.json()
+                except Exception as e:
+                    log_info(f"ImageBot: Rule34 JSON parse error for tag='{query_tag}': {e}")
+                    log_info(f"  Response text: {response.text[:200]}")
+                    continue
+
                 if not isinstance(data, list):
-                    response_preview = str(data)[:100]
-                    log_info(f"ImageBot: Rule34 {type(data).__name__} response for tag='{query_tag}': {response_preview}")
+                    log_info(f"ImageBot: Rule34 non-list response for tag='{query_tag}': {str(data)[:150]}")
+                    continue
+
+                if len(data) == 0:
+                    log_verbose(f"ImageBot: Rule34 returned empty list for tag='{query_tag}' pid={pid}")
                     continue
 
                 for post in data:
