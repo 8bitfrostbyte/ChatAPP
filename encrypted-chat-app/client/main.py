@@ -206,19 +206,25 @@ def _resolve_user_settings_path() -> Path:
     return settings_dir / "user_settings.json"
 
 
+def _normalize_server_url(server_url: str, default: str = "http://localhost:8000") -> str:
+    """Normalize a server URL for REST and WebSocket use."""
+    value = str(server_url or "").strip() or default
+    return value.rstrip("/")
+
+
 def _load_saved_server_url(default: str = "http://localhost:8000") -> str:
     """Load last used server URL for startup prompt."""
     try:
         settings_path = _resolve_user_settings_path()
         if not settings_path.exists():
-            return default
+            return _normalize_server_url(default, default)
         data = json.loads(settings_path.read_text(encoding="utf-8"))
         value = str(data.get("server_url", "")).strip()
         if value.lower().startswith(("http://", "https://")):
-            return value
+            return _normalize_server_url(value, default)
     except Exception:
         pass
-    return default
+    return _normalize_server_url(default, default)
 
 
 def _save_server_url(server_url: str):
@@ -230,7 +236,7 @@ def _save_server_url(server_url: str):
             loaded = json.loads(settings_path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 payload = loaded
-        payload["server_url"] = str(server_url or "").strip()
+        payload["server_url"] = _normalize_server_url(server_url)
         settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -240,7 +246,7 @@ class APIClient:
     """Client for interacting with the server REST API."""
     
     def __init__(self, server_url: str):
-        self.server_url = server_url
+        self.server_url = _normalize_server_url(server_url)
         self.token = None
         self.user_id = None
         self.username = None
@@ -1026,8 +1032,8 @@ class ChatWindow(QMainWindow):
     
     def __init__(self, server_url: str):
         super().__init__()
-        self.server_url = server_url
-        self.api_client = APIClient(server_url)
+        self.server_url = _normalize_server_url(server_url)
+        self.api_client = APIClient(self.server_url)
         self.current_room = None
         self.websocket_thread = None
         self.notification_handler = NotificationHandler(self)
@@ -2002,25 +2008,51 @@ class ChatWindow(QMainWindow):
         image_urls = self._extract_image_urls(content)
 
         if msg_type != "system" and image_urls:
-            # Download images in background and append exactly one rendered message.
+            # Show placeholder immediately (preserves message order), then rebuild once image is cached.
+            body_html = self._build_message_body_html(content, {})
+            self.message_display.append(self.format_message_html(username, body_html, msg_type))
+
             def _fetch_embeds(message_content, urls):
                 sources = {}
                 for image_url in urls:
                     uri = self._cache_image_url(image_url)
                     if uri:
                         sources[image_url] = uri
-                return self._build_message_body_html(message_content, sources)
+                return bool(sources)
 
-            def _apply(body_html):
-                if not body_html:
-                    body_html = self._build_message_body_html(content, {})
-                self.message_display.append(self.format_message_html(username, body_html, msg_type))
+            def _apply(any_loaded):
+                if any_loaded:
+                    self._schedule_chat_rebuild()
 
             self._run_in_bg(_fetch_embeds, _apply, content, image_urls)
             return
 
         body_html = self._build_message_body_html(content, {})
         self.message_display.append(self.format_message_html(username, body_html, msg_type))
+
+    def _schedule_chat_rebuild(self):
+        """Debounced full-document rebuild — coalesces multiple concurrent image downloads."""
+        if not hasattr(self, "_rebuild_timer"):
+            self._rebuild_timer = QTimer(self)
+            self._rebuild_timer.setSingleShot(True)
+            self._rebuild_timer.timeout.connect(self._rebuild_chat_display)
+        self._rebuild_timer.start(150)
+
+    def _rebuild_chat_display(self):
+        """Rebuild the chat display from _chat_raw_messages using any cached images."""
+        scrollbar = self.message_display.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 20
+        self.message_display.clear()
+        for msg in list(self._chat_raw_messages):
+            u = msg["username"]
+            c = msg["content"]
+            t = msg["msg_type"]
+            urls = self._extract_image_urls(c) if t != "system" else []
+            sources = {url: self._image_cache[url] for url in urls if url in self._image_cache}
+            body_html = self._build_message_body_html(c, sources)
+            self.message_display.append(self.format_message_html(u, body_html, t))
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
 
     def open_message_link(self, url: QUrl):
         """Open links clicked inside the chat display in the default browser."""
@@ -3923,8 +3955,16 @@ def main():
     if not ok:
         sys.exit(1)
 
-    server_url = str(server_url or "").strip() or default_server_url
+    entered_server_url = str(server_url or "").strip() or default_server_url
+    server_url = _normalize_server_url(entered_server_url, default_server_url)
     _save_server_url(server_url)
+
+    if entered_server_url != server_url:
+        QMessageBox.information(
+            None,
+            "Server URL Updated",
+            f"Using normalized server URL:\n{server_url}"
+        )
     
     app = ChatApp(sys.argv, server_url)
     sys.exit(app.exec())
