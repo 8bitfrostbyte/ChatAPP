@@ -327,8 +327,8 @@ class BotStreamManager:
             while True:
                 image_post = await asyncio.to_thread(image_bot.fetch_buffered_image, tag_pool)
                 if not image_post or not image_post.get("url"):
-                    fallback_tags = ", ".join(tag_pool) if tag_pool else "rating:explicit"
-                    fallback_images = await asyncio.to_thread(image_bot.fetch_images, fallback_tags, 1)
+                    fallback_tag = random.choice(tag_pool) if tag_pool else "rating:explicit"
+                    fallback_images = await asyncio.to_thread(image_bot.fetch_images, fallback_tag, 1)
                     if fallback_images:
                         image_post = fallback_images[0]
 

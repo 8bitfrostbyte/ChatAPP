@@ -674,10 +674,12 @@ class ImageBot:
                     timeout=15,
                 )
                 if response.status_code != 200:
+                    log_info(f"ImageBot: Rule34 HTTP {response.status_code} for tag='{query_tag}' pid={pid}")
                     continue
 
                 data = response.json()
                 if not isinstance(data, list):
+                    log_info(f"ImageBot: Rule34 unexpected response type {type(data)} for tag='{query_tag}'")
                     continue
 
                 for post in data:
@@ -700,7 +702,7 @@ class ImageBot:
                 if results:
                     break
         except Exception as e:
-            log_verbose(f"Buffer fetch error rule34 ({query_tag or 'random'}): {e}")
+            log_info(f"ImageBot: Rule34 fetch error ({query_tag or 'random'}): {type(e).__name__}: {e}")
 
         # Danbooru
         if use_danbooru:
