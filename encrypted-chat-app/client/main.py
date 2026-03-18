@@ -781,6 +781,31 @@ class APIClient:
 
         return False, last_error
 
+    def download_file_from_url(self, file_url: str, destination_path: str) -> tuple:
+        """Download a file URL to destination path."""
+        try:
+            url = str(file_url or "").strip()
+            if not url:
+                return False, "Missing file URL"
+            if url.startswith("/"):
+                url = f"{self.server_url.rstrip('/')}{url}"
+            elif not url.lower().startswith(("http://", "https://")):
+                url = f"{self.server_url.rstrip('/')}/{url.lstrip('/')}"
+
+            response = requests.get(url, headers=self._get_headers(), stream=True, timeout=(10, 60))
+            if response.status_code != 200:
+                return False, f"Download failed ({response.status_code})"
+
+            dest = Path(destination_path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+            return True, {"path": str(dest)}
+        except Exception as e:
+            return False, str(e)
+
 
 class WebSocketThread(QThread):
     """Thread for managing WebSocket connection."""
@@ -1119,8 +1144,8 @@ class ChatWindow(QMainWindow):
         send_btn.clicked.connect(self.send_message)
         button_layout.addWidget(send_btn)
 
-        upload_btn = QPushButton("Upload Image")
-        upload_btn.clicked.connect(self.upload_image)
+        upload_btn = QPushButton("Upload File")
+        upload_btn.clicked.connect(self.upload_file_dialog)
         button_layout.addWidget(upload_btn)
 
         settings_btn = QPushButton("Settings")
@@ -1559,13 +1584,22 @@ class ChatWindow(QMainWindow):
             return []
 
         urls = re.findall(
-            r'(?:https?://[^\s]+(?:\.(?:jpg|jpeg|png|gif|webp|bmp)(?:\?[^\s]*)?|/api/files/\d+(?:\?[^\s]*)?)|/api/files/\d+(?:\?[^\s]*)?)',
+            r'(?:https?://[^\s<>\"]+|/api/files/\d+(?:\?[^\s]*)?)',
             content,
             re.IGNORECASE,
         )
 
         normalized = []
         for url in urls:
+            # Trim punctuation that often trails links in chat text.
+            url = url.rstrip('.,);\"]')
+            lowered = url.lower()
+            is_image_ext = bool(re.search(r"\.(jpg|jpeg|png|gif|webp|bmp)(\?.*)?$", lowered))
+            # /api/files links are images only when the message text says [Image].
+            is_room_image = ("/api/files/" in lowered and "[image]" in content.lower())
+            if not (is_image_ext or is_room_image):
+                continue
+
             if url.startswith("/"):
                 normalized.append(f"{self.server_url.rstrip('/')}{url}")
             else:
@@ -1597,10 +1631,67 @@ class ChatWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _extract_attachment_from_message(self, message: dict) -> Optional[Dict]:
+        """Extract attachment metadata from API payloads for file download commands."""
+        if not isinstance(message, dict):
+            return None
+
+        file_id = message.get("file_id")
+        file_url = str(message.get("file_url") or "").strip()
+        filename = str(message.get("filename") or "").strip()
+        msg_type = str(message.get("message_type", "text")).lower()
+
+        if not file_url and file_id is not None:
+            file_url = f"{self.server_url}/api/files/{file_id}"
+        if file_url.startswith("/"):
+            file_url = f"{self.server_url.rstrip('/')}{file_url}"
+        elif file_url and not file_url.lower().startswith(("http://", "https://")):
+            file_url = f"{self.server_url.rstrip('/')}/{file_url.lstrip('/')}"
+
+        if not file_url:
+            return None
+
+        if not filename:
+            if file_id is not None:
+                filename = f"file_{file_id}"
+            else:
+                parsed_name = Path(urlparse(file_url).path).name
+                filename = parsed_name or "downloaded_file"
+
+        return {
+            "file_id": file_id,
+            "file_url": file_url,
+            "filename": filename,
+            "file_type": str(message.get("file_type") or ""),
+            "file_size": message.get("file_size"),
+            "message_type": msg_type,
+        }
+
+    def _find_attachment_by_filename(self, filename: str) -> Optional[Dict]:
+        """Find the most recent attachment in current chat view by filename."""
+        needle = str(filename or "").strip().lower()
+        if not needle:
+            return None
+
+        for msg in reversed(self._chat_raw_messages):
+            attachment = msg.get("attachment") if isinstance(msg, dict) else None
+            if not isinstance(attachment, dict):
+                continue
+            candidate = str(attachment.get("filename") or "").strip().lower()
+            if candidate == needle:
+                return attachment
+        return None
+
     def _display_content_from_message(self, message: dict) -> str:
         """Normalize API payload into displayable chat content."""
         content = str(message.get("content", ""))
         msg_type = str(message.get("message_type", "text"))
+
+        if msg_type == "file":
+            attachment = self._extract_attachment_from_message(message)
+            if attachment:
+                return f"[File] {attachment.get('filename')}\n{attachment.get('file_url')}"
+            return content
 
         if msg_type != "image":
             return content
@@ -1811,6 +1902,21 @@ class ChatWindow(QMainWindow):
         font_style = (f"font-family:'{ff}';" if ff else "") + f"font-size:{fs}px;"
 
         if msg_type == "system":
+            # Make online/offline presence lines easier to scan.
+            plain_body = html.unescape(re.sub(r"<br\s*/?>", "\n", body_html, flags=re.IGNORECASE)).strip()
+            presence_match = re.match(r"^(.+?)\s+is\s+(online|offline)$", plain_body, flags=re.IGNORECASE)
+            if presence_match:
+                presence_user = html.escape(presence_match.group(1).strip())
+                presence_state = presence_match.group(2).lower()
+                status_color = "#38d16a" if presence_state == "online" else "#ff4d4d"
+                return (
+                    f'<div style="margin:2px 0;color:{t["system_color"]};font-style:{sys_italic};{font_style}">'
+                    f'[{timestamp}] [SYSTEM] '
+                    f'<span style="color:#ffffff;">{presence_user}</span> '
+                    f'<span style="color:{status_color};">is {presence_state}</span>'
+                    f'</div>'
+                )
+
             return (
                 f'<div style="margin:2px 0;color:{t["system_color"]};font-style:{sys_italic};{font_style}">'
                 f'[{timestamp}] [SYSTEM] {body_html}</div>'
@@ -1830,7 +1936,7 @@ class ChatWindow(QMainWindow):
             f'</div>'
         )
 
-    def append_chat_message(self, username: str, content: str, msg_type: str = "text"):
+    def append_chat_message(self, username: str, content: str, msg_type: str = "text", attachment: Optional[Dict] = None):
         """Append one formatted message to the chat display."""
         if self._is_duplicate_presence_message(content, msg_type):
             return
@@ -1839,6 +1945,7 @@ class ChatWindow(QMainWindow):
             "username": username,
             "content": content,
             "msg_type": msg_type,
+            "attachment": attachment,
         })
 
         image_urls = self._extract_image_urls(content)
@@ -1996,7 +2103,8 @@ class ChatWindow(QMainWindow):
                 username = msg.get("username", "Unknown")
                 msg_type = msg.get("message_type", "text")
                 content = self._display_content_from_message(msg)
-                self.append_chat_message(username, content, msg_type)
+                attachment = self._extract_attachment_from_message(msg)
+                self.append_chat_message(username, content, msg_type, attachment)
             self._update_members(result["members"])
             self.connect_websocket()
 
@@ -2019,7 +2127,8 @@ class ChatWindow(QMainWindow):
                 username = msg.get("username", "Unknown")
                 msg_type = msg.get("message_type", "text")
                 content = self._display_content_from_message(msg)
-                self.append_chat_message(username, content, msg_type)
+                attachment = self._extract_attachment_from_message(msg)
+                self.append_chat_message(username, content, msg_type, attachment)
         self._run_in_bg(_fetch, _apply, self.current_room)
     
     def send_message(self):
@@ -2078,12 +2187,36 @@ class ChatWindow(QMainWindow):
             self.message_input.clear()
             return
 
+        if first_token == "!download":
+            try:
+                parts = shlex.split(content)
+            except ValueError:
+                self.append_system_message("Usage: !download <filename> <folder_path>")
+                self.message_input.clear()
+                return
+
+            if len(parts) < 3:
+                self.append_system_message("Usage: !download <filename> <folder_path>")
+                self.message_input.clear()
+                return
+
+            filename = parts[1].strip()
+            folder_path = " ".join(parts[2:]).strip()
+            if not filename or not folder_path:
+                self.append_system_message("Usage: !download <filename> <folder_path>")
+                self.message_input.clear()
+                return
+
+            self.download_attachment_by_name(filename, folder_path)
+            self.message_input.clear()
+            return
+
         if content.startswith("!botcommand") or content.startswith("!botcommands"):
             self.show_bot_commands()
             self.message_input.clear()
             return
 
-        if content.startswith("!room") or content.startswith("!createroom") or content.startswith("!removeroom") or content.startswith("!rooms") or content.startswith("!makeprivate") or content.startswith("!invite"):
+        if content.startswith("!room") or content.startswith("!createroom") or content.startswith("!removeroom") or content.startswith("!rooms") or content.startswith("!makeprivate") or content.startswith("!invite") or content.startswith("!leaveroom"):
             self.handle_room_command(content)
             self.message_input.clear()
             return
@@ -2112,8 +2245,11 @@ class ChatWindow(QMainWindow):
             "!removeroom <name|id> - Delete a room (creator-only)",
             "!makeprivate - Make current room private (creator-only)",
             "!invite <username> <room_name|id> - Invite user to room (creator-only)",
+            "!leaveroom [room_name|id] - Leave a room (current room if omitted)",
+            "Invite flow: invited users accept/decline through in-app popup",
             "!clear <count> - Clear recent non-system messages in this room",
             "!saveimages [folder_path] - Save all image URLs currently visible in chat to a folder",
+            "!download <filename> <folder_path> - Download an uploaded file from current chat",
             "!room clear <count> - Alias for clearing recent room messages",
             "!botcommands - Show bot command list",
             "/room list - List available rooms",
@@ -2552,6 +2688,50 @@ class ChatWindow(QMainWindow):
         """Handle room creation/deletion commands from chat input."""
         cmd = raw_command.strip()
 
+        if cmd.startswith("!leaveroom"):
+            rest = cmd[len("!leaveroom"):].strip()
+
+            target_room_id = None
+            if not rest:
+                target_room_id = self.current_room
+            elif rest.isdigit():
+                target_room_id = int(rest)
+            else:
+                normalized = rest.lower()
+                for rid, info in self._rooms_data.items():
+                    if str(info.get("name", "")).strip().lower() == normalized:
+                        target_room_id = int(rid)
+                        break
+
+            if not target_room_id:
+                self.append_system_message("Usage: !leaveroom [room_name_or_id]")
+                return
+
+            def _apply_leave(result):
+                success, payload = result if result else (False, "Request failed")
+                if not success:
+                    self.append_system_message(f"Leave room failed: {payload}")
+                    return
+
+                self.append_system_message(payload.get("message", "Left room successfully"))
+
+                if self.current_room == target_room_id:
+                    if self.websocket_thread:
+                        self.websocket_thread.stop()
+                        self.websocket_thread.wait(1500)
+                        self.websocket_thread = None
+                    self.current_room = None
+                    self.room_name_label.setText("Select a room")
+                    self.message_display.clear()
+                    self.members_list.clear()
+                    self._chat_raw_messages.clear()
+                    self._seen_live_message_keys.clear()
+
+                self.refresh_rooms()
+
+            self._run_in_bg(self.api_client.leave_room, _apply_leave, target_room_id)
+            return
+
         if cmd.startswith("!makeprivate"):
             if not self.current_room:
                 self.append_system_message("Join a room first, then run !makeprivate")
@@ -2790,18 +2970,42 @@ class ChatWindow(QMainWindow):
             return
         self.append_system_message(result.get("message", "Messages cleared"))
         self.load_messages()
+
+    def download_attachment_by_name(self, filename: str, folder_path: str):
+        """Download the most recent attachment in chat matching filename."""
+        attachment = self._find_attachment_by_filename(filename)
+        if not attachment:
+            self.append_system_message(f"Download failed: file not found in current chat view: {filename}")
+            return
+
+        target_dir = Path(folder_path)
+        target_file = target_dir / attachment.get("filename", filename)
+
+        def _apply_download(result):
+            success, payload = result if result else (False, "Download failed")
+            if not success:
+                self.append_system_message(f"Download failed: {payload}")
+                return
+            self.append_system_message(f"Downloaded file: {target_file}")
+
+        self._run_in_bg(
+            self.api_client.download_file_from_url,
+            _apply_download,
+            attachment.get("file_url", ""),
+            str(target_file),
+        )
     
-    def upload_image(self):
-        """Upload an image to the current room."""
+    def upload_file_dialog(self):
+        """Upload any file type to the current room."""
         if not self.current_room:
             QMessageBox.warning(self, "Error", "Please select a room first")
             return
         
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Image",
+            "Select File",
             "",
-            "Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp)"
+            "All Files (*)"
         )
         if file_path:
             room_id = self.current_room
@@ -2813,7 +3017,8 @@ class ChatWindow(QMainWindow):
                 success, payload = result if result else (False, "Upload failed")
                 if success:
                     self._remember_uploaded_image_url(payload)
-                    QMessageBox.information(self, "Success", "Image uploaded")
+                    uploaded_name = str(payload.get("filename") or Path(file_path).name)
+                    QMessageBox.information(self, "Success", f"File uploaded: {uploaded_name}")
                     if room_id == self.current_room:
                         self.load_messages()
                 else:
@@ -2859,8 +3064,9 @@ class ChatWindow(QMainWindow):
         username = data.get("username", "Unknown")
         msg_type = data.get("message_type", "text")
         content = self._display_content_from_message(data)
+        attachment = self._extract_attachment_from_message(data)
 
-        self.append_chat_message(username, content, msg_type)
+        self.append_chat_message(username, content, msg_type, attachment)
         
         # Only notify (sound) for messages from other users
         if username != self.api_client.username:
@@ -2869,8 +3075,8 @@ class ChatWindow(QMainWindow):
     def on_user_joined(self, data: dict):
         """Handle user joined and refresh member list."""
         username = data.get("username", "Unknown")
-        message = f"{username} is online"
-        self.append_chat_message("SYSTEM", message, "system")
+        self.append_chat_message("SYSTEM", f"{username} has joined the room", "system")
+        self.append_chat_message("SYSTEM", f"{username} is online", "system")
         if username != self.api_client.username:
             self.notification_handler.notify_user_joined(username)
         self.refresh_members()
@@ -2878,9 +3084,8 @@ class ChatWindow(QMainWindow):
     def on_user_left(self, data: dict):
         """Handle user left."""
         username = data.get("username", "Unknown")
-        message = f"{username} is offline"
-
-        self.append_chat_message("SYSTEM", message, "system")
+        self.append_chat_message("SYSTEM", f"{username} has left the room", "system")
+        self.append_chat_message("SYSTEM", f"{username} is offline", "system")
         self.notification_handler.notify_user_left(username)
         self.refresh_members()
     

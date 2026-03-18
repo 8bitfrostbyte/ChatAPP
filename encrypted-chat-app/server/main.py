@@ -71,7 +71,8 @@ class ConnectionManager:
         self.room_user_connections[room_id][user_id] = self.room_user_connections[room_id].get(user_id, 0) + 1
         self.touch(room_id, user_id)
     
-    def disconnect(self, websocket: WebSocket, room_id: int, user_id: int):
+    def disconnect(self, websocket: WebSocket, room_id: int, user_id: int) -> bool:
+        user_went_offline = False
         if room_id in self.active_connections:
             if websocket in self.active_connections[room_id]:
                 self.active_connections[room_id].remove(websocket)
@@ -82,6 +83,7 @@ class ConnectionManager:
             current = self.room_user_connections[room_id].get(user_id, 0)
             if current <= 1:
                 self.room_user_connections[room_id].pop(user_id, None)
+                user_went_offline = True
             else:
                 self.room_user_connections[room_id][user_id] = current - 1
             if not self.room_user_connections[room_id]:
@@ -91,6 +93,8 @@ class ConnectionManager:
             self.room_user_last_seen[room_id].pop(user_id, None)
             if not self.room_user_last_seen[room_id]:
                 del self.room_user_last_seen[room_id]
+
+        return user_went_offline
 
     def touch(self, room_id: int, user_id: int):
         if room_id not in self.room_user_last_seen:
@@ -119,6 +123,41 @@ class ConnectionManager:
                     pass
 
 manager = ConnectionManager()
+
+
+def _delete_message_files_from_disk(message: Message):
+    """Remove message attachment files from disk (best effort)."""
+    for file_obj in list(message.files or []):
+        try:
+            if file_obj.file_path:
+                p = Path(file_obj.file_path)
+                if p.exists() and p.is_file():
+                    p.unlink()
+        except Exception:
+            # Keep deletion flow resilient even if one file cannot be removed.
+            pass
+
+
+def _hard_delete_message(db: Session, message: Message):
+    """Permanently delete a message and any files attached to it."""
+    # Only remove user-generated message content and its files.
+    if str(message.message_type or "").lower() not in {"text", "image", "file", "bot"}:
+        return
+    _delete_message_files_from_disk(message)
+    db.delete(message)
+
+
+def _purge_soft_deleted_messages(db: Session):
+    """Cleanup legacy soft-deleted messages so they no longer consume storage."""
+    stale = db.query(Message).filter(
+        Message.deleted_at != None,
+        Message.message_type.in_(["text", "image", "file", "bot"]),
+    ).all()
+    if not stale:
+        return
+    for msg in stale:
+        _hard_delete_message(db, msg)
+    db.commit()
 
 
 def _parse_version_tuple(value: str) -> tuple:
@@ -412,6 +451,9 @@ async def startup():
     all_rooms = db.query(Room).all()
     for room in all_rooms:
         ensure_room_encryption_key(db, room)
+
+    # Remove any previously soft-deleted rows/files from older builds.
+    _purge_soft_deleted_messages(db)
     db.close()
 
 
@@ -736,7 +778,7 @@ async def join_room(
         "type": "user_joined",
         "room_id": room_id,
         "username": user.username,
-        "message": f"{user.username} is online"
+        "message": f"{user.username} has joined the room"
     })
     await manager.broadcast(room_id, {
         "type": "system_message",
@@ -786,7 +828,7 @@ async def leave_room(
         "type": "user_left",
         "room_id": room_id,
         "username": user.username,
-        "message": f"{user.username} is offline"
+        "message": f"{user.username} has left the room"
     })
     await manager.broadcast(room_id, {
         "type": "system_message",
@@ -1059,9 +1101,12 @@ async def get_messages(
                 "created_at": msg.created_at
             }
 
-            if msg.message_type == "image" and msg.files:
+            if msg.files:
                 file_obj = msg.files[0]
                 payload["file_id"] = file_obj.id
+                payload["filename"] = file_obj.filename
+                payload["file_type"] = file_obj.file_type
+                payload["file_size"] = file_obj.file_size
                 if base_url:
                     payload["file_url"] = f"{base_url}/api/files/{file_obj.id}"
                 else:
@@ -1081,7 +1126,7 @@ async def delete_message(
     authorization: str = Header(None),
     db: Session = Depends(get_db)
 ):
-    """Delete a message (soft delete)."""
+    """Delete a message permanently, including any attached files."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
     
@@ -1094,11 +1139,14 @@ async def delete_message(
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
     
-    # Only the sender can delete
+    # Only the sender can delete user-generated message content.
     if message.user_id != user.id:
         raise HTTPException(status_code=403, detail="Can only delete your own messages")
+
+    if str(message.message_type or "").lower() not in {"text", "image", "file", "bot"}:
+        raise HTTPException(status_code=403, detail="System messages cannot be deleted")
     
-    message.deleted_at = datetime.utcnow()
+    _hard_delete_message(db, message)
     db.commit()
     
     await manager.broadcast(message.room_id, {
@@ -1150,11 +1198,10 @@ async def clear_room_messages(
     if not target_messages:
         return {"deleted": 0, "message": "No matching messages to clear"}
 
-    now = datetime.utcnow()
     deleted_ids = []
     for msg in target_messages:
-        msg.deleted_at = now
         deleted_ids.append(msg.id)
+        _hard_delete_message(db, msg)
 
     db.commit()
 
@@ -1183,7 +1230,7 @@ async def upload_file(
     authorization: str = Header(None),
     db: Session = Depends(get_db)
 ):
-    """Upload an image file."""
+    """Upload a file attachment (images and non-images)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
     
@@ -1203,37 +1250,12 @@ async def upload_file(
     if not member:
         raise HTTPException(status_code=403, detail="Not a member of this room")
     
-    # Validate file type
-    allowed_types = {
-        "image/jpeg",
-        "image/png",
-        "image/gif",
-        "image/webp",
-        "image/bmp",
-    }
-    allowed_extensions = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-
     file_extension = Path(file.filename or "").suffix.lower()
     normalized_content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
     guessed_content_type = (mimetypes.guess_type(file.filename or "")[0] or "").lower()
 
-    if (
-        normalized_content_type not in allowed_types
-        and guessed_content_type not in allowed_types
-        and file_extension not in allowed_extensions
-    ):
-        raise HTTPException(status_code=400, detail="Only image files are allowed")
-
-    effective_content_type = normalized_content_type or guessed_content_type
-    if effective_content_type not in allowed_types:
-        effective_content_type = {
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-            ".bmp": "image/bmp",
-        }.get(file_extension, "image/jpeg")
+    # Accept arbitrary file types; infer a best-effort content-type.
+    effective_content_type = normalized_content_type or guessed_content_type or "application/octet-stream"
     
     # Save file
     unique_filename = f"{user.id}_{datetime.utcnow().timestamp()}{file_extension}"
@@ -1243,12 +1265,16 @@ async def upload_file(
         content = await file.read()
         buffer.write(content)
     
-    # Create message with image
+    is_image = effective_content_type.startswith("image/") or file_extension in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+    message_type = "image" if is_image else "file"
+    message_text = "[Image]" if is_image else f"[File] {file.filename}"
+
+    # Create message with file metadata
     message = Message(
         room_id=room_id,
         user_id=user.id,
-        content=encryption_manager.encrypt_message(room_id, "[Image]"),
-        message_type="image"
+        content=encryption_manager.encrypt_message(room_id, message_text),
+        message_type=message_type
     )
     db.add(message)
     db.commit()
@@ -1275,14 +1301,25 @@ async def upload_file(
         "user_id": user.id,
         "room_id": room_id,
         "username": user.username,
-        "content": "[Image]",
-        "message_type": "image",
+        "content": message_text,
+        "message_type": message_type,
         "file_id": db_file.id,
+        "filename": db_file.filename,
+        "file_type": db_file.file_type,
+        "file_size": db_file.file_size,
         "file_url": file_url,
         "created_at": message.created_at.isoformat()
     })
     
-    return {"message_id": message.id, "file_id": db_file.id}
+    return {
+        "message_id": message.id,
+        "file_id": db_file.id,
+        "filename": db_file.filename,
+        "file_type": db_file.file_type,
+        "file_size": db_file.file_size,
+        "message_type": message_type,
+        "file_url": file_url,
+    }
 
 
 @app.get("/api/files/{file_id}")
@@ -1579,7 +1616,25 @@ async def websocket_endpoint(room_id: int, token: str, websocket: WebSocket):
         print(f"WebSocket error: {e}")
     
     finally:
-        manager.disconnect(websocket, room_id, user.id)
+        user_went_offline = manager.disconnect(websocket, room_id, user.id)
+
+        if user_went_offline:
+            still_member = db.query(RoomMember).filter(
+                RoomMember.user_id == user.id,
+                RoomMember.room_id == room_id
+            ).first()
+            if still_member:
+                await manager.broadcast(room_id, {
+                    "type": "user_left",
+                    "room_id": room_id,
+                    "username": user.username,
+                    "message": f"{user.username} has left the room"
+                })
+                await manager.broadcast(room_id, {
+                    "type": "system_message",
+                    "room_id": room_id,
+                    "message": f"{user.username} is offline"
+                })
         db.close()
 
 

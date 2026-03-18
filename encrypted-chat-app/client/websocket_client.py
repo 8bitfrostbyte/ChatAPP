@@ -127,12 +127,10 @@ class WebSocketClient:
                 self.on_message_deleted_callback(data)
 
         elif msg_type == "system_message":
-            if self.on_message_callback:
-                self.on_message_callback({
-                    "username": "SYSTEM",
-                    "content": data.get("message", ""),
-                    "message_type": "system",
-                })
+            # Keep chat signal clean: explicit presence events are handled via
+            # user_joined/user_left callbacks, and local command output is shown
+            # by the command handlers themselves.
+            return
     
     async def send_message(self, content: str):
         """Send a text message."""
