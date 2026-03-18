@@ -324,6 +324,7 @@ class BotStreamManager:
                 f"Image stream started: every {interval:g}s | mode: {mode} | tags: {', '.join(tag_pool)}"
             )
             miss_count = 0
+            error_streak = 0
             while True:
                 image_post = await asyncio.to_thread(image_bot.fetch_buffered_image, tag_pool)
                 if not image_post or not image_post.get("url"):
@@ -340,14 +341,19 @@ class BotStreamManager:
                     )
                     await self._post_bot_message(room_id, msg)
                     miss_count = 0
+                    error_streak = 0
                 else:
+                    error_streak += 1
                     miss_count += 1
                     if miss_count in {1, 5}:
-                        await self._post_bot_message(
-                            room_id,
-                            "No image result right now. Retrying..."
-                        )
-                await asyncio.sleep(interval)
+                        status = "No image result right now. Retrying..."
+                        if error_streak > 10:
+                            status += " (experiencing API issues, check back soon)"
+                        await self._post_bot_message(room_id, status)
+                
+                # Adaptive backoff: if error streak is high, sleep longer
+                sleep_time = interval * (1 + min(error_streak // 3, 4))
+                await asyncio.sleep(sleep_time)
         except asyncio.CancelledError:
             raise
         except Exception as e:

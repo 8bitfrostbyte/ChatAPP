@@ -679,7 +679,8 @@ class ImageBot:
 
                 data = response.json()
                 if not isinstance(data, list):
-                    log_info(f"ImageBot: Rule34 unexpected response type {type(data)} for tag='{query_tag}'")
+                    response_preview = str(data)[:100]
+                    log_info(f"ImageBot: Rule34 {type(data).__name__} response for tag='{query_tag}': {response_preview}")
                     continue
 
                 for post in data:
