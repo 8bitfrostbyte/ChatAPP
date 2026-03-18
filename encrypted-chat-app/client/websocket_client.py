@@ -14,7 +14,7 @@ class WebSocketClient:
     """Manages WebSocket connection to the server."""
     
     def __init__(self, server_url: str, token: str, room_id: int):
-        self.server_url = server_url
+        self.server_url = str(server_url or "").strip().rstrip("/")
         self.token = token
         self.room_id = room_id
         self.websocket = None

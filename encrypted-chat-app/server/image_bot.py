@@ -5,6 +5,14 @@ Searches and streams images from Rule34 and Danbooru APIs.
 
 import json
 import os
+# Load environment variables from .env in parent directory
+try:
+    from dotenv import load_dotenv
+    import os
+    dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+    load_dotenv(dotenv_path)
+except ImportError:
+    pass
 import random
 import threading
 import xml.etree.ElementTree as ET
