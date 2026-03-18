@@ -825,15 +825,42 @@ class WebSocketThread(QThread):
         self.client = None
         self.loop = None
 
-    async def _run_client(self):
-        self.client = WebSocketClient(self.server_url, self.token, self.room_id)
-        self.client.set_on_message(lambda data: self.message_received.emit(data))
-        self.client.set_on_user_joined(lambda data: self.user_joined.emit(data))
-        self.client.set_on_user_left(lambda data: self.user_left.emit(data))
-        self.client.set_on_typing(lambda data: self.typing_received.emit(data))
-        self.client.set_on_message_deleted(lambda data: self.message_deleted.emit(data))
+    def _ensure_membership(self) -> bool:
+        """Best-effort join attempt before websocket reconnect."""
+        try:
+            response = requests.post(
+                f"{self.server_url}/api/rooms/{self.room_id}/join",
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=8,
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
 
-        await self.client.connect()
+    async def _run_client(self):
+        def _init_client():
+            self.client = WebSocketClient(self.server_url, self.token, self.room_id)
+            self.client.set_on_message(lambda data: self.message_received.emit(data))
+            self.client.set_on_user_joined(lambda data: self.user_joined.emit(data))
+            self.client.set_on_user_left(lambda data: self.user_left.emit(data))
+            self.client.set_on_typing(lambda data: self.typing_received.emit(data))
+            self.client.set_on_message_deleted(lambda data: self.message_deleted.emit(data))
+
+        _init_client()
+        try:
+            await self.client.connect()
+        except Exception as first_error:
+            if "403" in str(first_error):
+                # Membership might be stale on this client/session; re-join then retry once.
+                joined = await asyncio.to_thread(self._ensure_membership)
+                if joined:
+                    _init_client()
+                    await self.client.connect()
+                else:
+                    raise first_error
+            else:
+                raise
+
         if self.client.receive_task:
             try:
                 await self.client.receive_task
@@ -1054,8 +1081,6 @@ class ChatWindow(QMainWindow):
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         # Allow dragging chat pane to full width by collapsing sibling pane.
         self.main_splitter.setChildrenCollapsible(True)
-        self.main_splitter.setCollapsible(0, True)
-        self.main_splitter.setCollapsible(1, True)
         self.main_splitter.setHandleWidth(8)
         self.main_splitter.setOpaqueResize(True)
         
@@ -1115,8 +1140,6 @@ class ChatWindow(QMainWindow):
         self.chat_splitter = QSplitter(Qt.Orientation.Vertical)
         # Allow dragging message area to full height by collapsing composer pane.
         self.chat_splitter.setChildrenCollapsible(True)
-        self.chat_splitter.setCollapsible(0, True)
-        self.chat_splitter.setCollapsible(1, True)
         self.chat_splitter.setHandleWidth(8)
         self.chat_splitter.setOpaqueResize(True)
 
@@ -1159,6 +1182,8 @@ class ChatWindow(QMainWindow):
         composer_layout.addLayout(button_layout)
         composer_widget.setLayout(composer_layout)
         self.chat_splitter.addWidget(composer_widget)
+        self.chat_splitter.setCollapsible(0, True)
+        self.chat_splitter.setCollapsible(1, True)
         self.chat_splitter.setStretchFactor(0, 1)
         self.chat_splitter.setStretchFactor(1, 0)
         self.chat_splitter.setSizes([520, 120])
@@ -1166,12 +1191,12 @@ class ChatWindow(QMainWindow):
         # Top-edge drag support for message area (drag handle above messages).
         self.chat_area_splitter = QSplitter(Qt.Orientation.Vertical)
         self.chat_area_splitter.setChildrenCollapsible(True)
-        self.chat_area_splitter.setCollapsible(0, True)
-        self.chat_area_splitter.setCollapsible(1, True)
         self.chat_area_splitter.setHandleWidth(8)
         self.chat_area_splitter.setOpaqueResize(True)
         self.chat_area_splitter.addWidget(self.room_name_label)
         self.chat_area_splitter.addWidget(self.chat_splitter)
+        self.chat_area_splitter.setCollapsible(0, True)
+        self.chat_area_splitter.setCollapsible(1, True)
         self.chat_area_splitter.setStretchFactor(0, 0)
         self.chat_area_splitter.setStretchFactor(1, 1)
         self.chat_area_splitter.setSizes([34, 606])
@@ -1182,6 +1207,8 @@ class ChatWindow(QMainWindow):
 
         self.main_splitter.addWidget(self.sidebar_widget)
         self.main_splitter.addWidget(chat_widget)
+        self.main_splitter.setCollapsible(0, True)
+        self.main_splitter.setCollapsible(1, True)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([280, 720])
@@ -1189,12 +1216,12 @@ class ChatWindow(QMainWindow):
         # Global vertical splitter enables dragging from top edge too (collapse header).
         self.window_splitter = QSplitter(Qt.Orientation.Vertical)
         self.window_splitter.setChildrenCollapsible(True)
-        self.window_splitter.setCollapsible(0, True)
-        self.window_splitter.setCollapsible(1, True)
         self.window_splitter.setHandleWidth(8)
         self.window_splitter.setOpaqueResize(True)
         self.window_splitter.addWidget(header_widget)
         self.window_splitter.addWidget(self.main_splitter)
+        self.window_splitter.setCollapsible(0, True)
+        self.window_splitter.setCollapsible(1, True)
         self.window_splitter.setStretchFactor(0, 0)
         self.window_splitter.setStretchFactor(1, 1)
         self.window_splitter.setSizes([28, 572])
