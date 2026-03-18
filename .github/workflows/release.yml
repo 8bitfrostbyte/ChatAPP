@@ -60,7 +60,13 @@ jobs:
       - name: Build EncryptedChat.exe
         shell: pwsh
         run: |
-          pyinstaller encrypted-chat-app/client/EncryptedChat.spec --noconfirm --clean
+          Push-Location "encrypted-chat-app/client"
+          try {
+            pyinstaller EncryptedChat.spec --noconfirm --clean
+          }
+          finally {
+            Pop-Location
+          }
 
       - name: Verify EXE Exists
         shell: pwsh
