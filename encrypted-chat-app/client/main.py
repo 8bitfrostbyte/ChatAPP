@@ -1765,6 +1765,15 @@ class ChatWindow(QMainWindow):
         if msg_type == "file":
             attachment = self._extract_attachment_from_message(message)
             if attachment:
+                file_type = str(attachment.get("file_type") or "").lower()
+                filename = str(attachment.get("filename") or "")
+                ext = Path(filename).suffix.lower()
+                is_image_file = (
+                    file_type.startswith("image/")
+                    or ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+                )
+                if is_image_file:
+                    return f"[Image] {attachment.get('file_url')}"
                 return f"[File] {attachment.get('filename')}\n{attachment.get('file_url')}"
             return content
 
