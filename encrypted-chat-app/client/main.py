@@ -456,7 +456,7 @@ class APIClient:
         except Exception as e:
             return False, []
     
-    def get_messages(self, room_id: int, limit: int = 50, offset: int = 0) -> tuple:
+    def get_messages(self, room_id: int, limit: int = 500, offset: int = 0) -> tuple:
         """Get message history."""
         try:
             response = requests.get(
@@ -2218,7 +2218,7 @@ class ChatWindow(QMainWindow):
             if not ok_join:
                 print("join_room failed")
                 return None
-            ok_msgs, messages = self.api_client.get_messages(rid, limit=50)
+            ok_msgs, messages = self.api_client.get_messages(rid, limit=500)
             ok_mbrs, members = self.api_client.get_room_members(rid)
             print("Fetched messages:", messages)
             print("Fetched members:", members)
@@ -2253,19 +2253,20 @@ class ChatWindow(QMainWindow):
         self._run_in_bg(_fetch, _apply, room_id)
 
     def load_messages(self):
-        def _apply(messages):
-            print("IN _apply, messages param:", messages)  # <-- Add this as the first line
         """Reload message history for current room in background."""
         if not self.current_room:
             return
         def _fetch(rid):
-            ok, msgs = self.api_client.get_messages(rid, limit=50)
+            ok, msgs = self.api_client.get_messages(rid, limit=500)
             return msgs if ok else []
         def _apply(messages):
             print("Loaded messages:", messages)  # DEBUG: Print loaded messages
             self.message_display.clear()
             self._chat_raw_messages.clear()
             self._seen_live_message_keys.clear()
+            # Reset deduplication state so deleted presence messages do not reappear
+            self._last_presence_message = None
+            self._last_presence_at = 0
             deduped_messages = self._dedupe_presence_history(messages)
             for msg in deduped_messages:
                 self._seen_live_message_keys.add(self._message_event_key(msg))

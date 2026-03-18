@@ -1083,7 +1083,7 @@ async def get_room_members(
 @app.get("/api/rooms/{room_id}/messages")
 async def get_messages(
     room_id: int,
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     request: Request = None,
     authorization: str = Header(None),
