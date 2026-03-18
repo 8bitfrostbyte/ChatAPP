@@ -142,9 +142,6 @@ def _delete_message_files_from_disk(message: Message):
 
 def _hard_delete_message(db: Session, message: Message):
     """Permanently delete a message and any files attached to it."""
-    # Only remove user-generated message content and its files.
-    if str(message.message_type or "").lower() not in {"text", "image", "file", "bot"}:
-        return
     _delete_message_files_from_disk(message)
     db.delete(message)
 
