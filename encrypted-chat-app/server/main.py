@@ -317,6 +317,7 @@ class BotStreamManager:
             db.add(message)
             db.commit()
             db.refresh(message)
+            print(f"[DEBUG] _post_bot_message: Saved bot message id={message.id} room_id={room_id} user_id={bot_user_id} content={content}")
             await manager.broadcast(room_id, {
                 "type": "message_new",
                 "id": message.id,
@@ -326,6 +327,7 @@ class BotStreamManager:
                 "message_type": "bot",
                 "created_at": message.created_at.isoformat()
             })
+            print(f"[DEBUG] _post_bot_message: Broadcasted bot message id={message.id} room_id={room_id}")
         finally:
             db.close()
 
