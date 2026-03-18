@@ -1673,12 +1673,36 @@ class ChatWindow(QMainWindow):
         if not needle:
             return None
 
+        # 1) Exact filename match first.
         for msg in reversed(self._chat_raw_messages):
             attachment = msg.get("attachment") if isinstance(msg, dict) else None
             if not isinstance(attachment, dict):
                 continue
             candidate = str(attachment.get("filename") or "").strip().lower()
             if candidate == needle:
+                return attachment
+
+        # 2) If no extension provided, match against filename stem.
+        needle_stem = Path(needle).stem if "." in needle else needle
+        for msg in reversed(self._chat_raw_messages):
+            attachment = msg.get("attachment") if isinstance(msg, dict) else None
+            if not isinstance(attachment, dict):
+                continue
+            candidate = str(attachment.get("filename") or "").strip().lower()
+            candidate_stem = Path(candidate).stem
+            if candidate_stem == needle_stem:
+                return attachment
+
+        # 3) Prefix/contains fallback so commands like !download Diablo files work.
+        for msg in reversed(self._chat_raw_messages):
+            attachment = msg.get("attachment") if isinstance(msg, dict) else None
+            if not isinstance(attachment, dict):
+                continue
+            candidate = str(attachment.get("filename") or "").strip().lower()
+            candidate_stem = Path(candidate).stem
+            if candidate.startswith(needle) or candidate_stem.startswith(needle_stem):
+                return attachment
+            if needle in candidate or needle_stem in candidate_stem:
                 return attachment
         return None
 
@@ -2196,14 +2220,14 @@ class ChatWindow(QMainWindow):
                 return
 
             if len(parts) < 3:
-                self.append_system_message("Usage: !download <filename> <folder_path>")
+                self.append_system_message("Usage: !download <filename> <folder_path> (quote filename if it has spaces)")
                 self.message_input.clear()
                 return
 
             filename = parts[1].strip()
             folder_path = " ".join(parts[2:]).strip()
             if not filename or not folder_path:
-                self.append_system_message("Usage: !download <filename> <folder_path>")
+                self.append_system_message("Usage: !download <filename> <folder_path> (quote filename if it has spaces)")
                 self.message_input.clear()
                 return
 

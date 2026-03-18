@@ -61,8 +61,9 @@ class ConnectionManager:
         # room_id -> {user_id -> unix timestamp}
         self.room_user_last_seen: Dict[int, Dict[int, float]] = {}
     
-    async def connect(self, websocket: WebSocket, room_id: int, user_id: int):
+    async def connect(self, websocket: WebSocket, room_id: int, user_id: int) -> bool:
         await websocket.accept()
+        prior_count = (self.room_user_connections.get(room_id) or {}).get(user_id, 0)
         if room_id not in self.active_connections:
             self.active_connections[room_id] = []
         self.active_connections[room_id].append(websocket)
@@ -70,6 +71,7 @@ class ConnectionManager:
             self.room_user_connections[room_id] = {}
         self.room_user_connections[room_id][user_id] = self.room_user_connections[room_id].get(user_id, 0) + 1
         self.touch(room_id, user_id)
+        return prior_count == 0
     
     def disconnect(self, websocket: WebSocket, room_id: int, user_id: int) -> bool:
         user_went_offline = False
@@ -1572,7 +1574,20 @@ async def websocket_endpoint(room_id: int, token: str, websocket: WebSocket):
         await websocket.close(code=4003, reason="Not a member of this room")
         return
     
-    await manager.connect(websocket, room_id, user.id)
+    became_online = await manager.connect(websocket, room_id, user.id)
+
+    if became_online:
+        await manager.broadcast(room_id, {
+            "type": "user_joined",
+            "room_id": room_id,
+            "username": user.username,
+            "message": f"{user.username} has joined the room"
+        })
+        await manager.broadcast(room_id, {
+            "type": "system_message",
+            "room_id": room_id,
+            "message": f"{user.username} is online"
+        })
     
     try:
         while True:
