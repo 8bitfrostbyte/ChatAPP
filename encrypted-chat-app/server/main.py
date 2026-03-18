@@ -1168,7 +1168,7 @@ async def clear_room_messages(
 ):
     """Clear recent messages in a room.
 
-    Any room member can clear recent non-system messages.
+    Any room member can clear recent messages, including presence/system lines.
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
@@ -1191,8 +1191,7 @@ async def clear_room_messages(
 
     query = db.query(Message).filter(
         Message.room_id == room_id,
-        Message.deleted_at == None,
-        Message.message_type != "system"
+        Message.deleted_at == None
     )
 
     target_messages = query.order_by(Message.created_at.desc()).limit(count).all()
@@ -1565,14 +1564,19 @@ async def websocket_endpoint(room_id: int, token: str, websocket: WebSocket):
         await websocket.close(code=4004, reason="Room not found")
         return
     
-    # Check user is member
+    # Check websocket room access. Public rooms auto-admit on connect if needed.
     member = db.query(RoomMember).filter(
         RoomMember.user_id == user.id,
         RoomMember.room_id == room_id
     ).first()
     if not member:
-        await websocket.close(code=4003, reason="Not a member of this room")
-        return
+        if room.is_private and room.created_by != user.id:
+            await websocket.close(code=4003, reason="Not a member of this room")
+            return
+        if not room.is_private:
+            member = RoomMember(user_id=user.id, room_id=room_id)
+            db.add(member)
+            db.commit()
     
     became_online = await manager.connect(websocket, room_id, user.id)
 
