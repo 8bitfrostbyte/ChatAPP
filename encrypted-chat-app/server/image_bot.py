@@ -651,42 +651,54 @@ class ImageBot:
 
         # Rule34
         try:
-            params = {
-                "page": "dapi",
-                "s": "post",
-                "q": "index",
-                "json": 1,
-                "limit": min(limit, 100),
-                "pid": random.randint(0, 50),
-                "tags": query_tag,
-            }
-            if self.config.rule34_user_id and self.config.rule34_api_key:
-                params["user_id"] = self.config.rule34_user_id
-                params["api_key"] = self.config.rule34_api_key
+            page_candidates = [random.randint(0, 20), 0, 1, 2]
+            seen_rule34_urls = set()
+            for pid in page_candidates:
+                params = {
+                    "page": "dapi",
+                    "s": "post",
+                    "q": "index",
+                    "json": 1,
+                    "limit": min(limit, 100),
+                    "pid": pid,
+                    "tags": query_tag,
+                }
+                if self.config.rule34_user_id and self.config.rule34_api_key:
+                    params["user_id"] = self.config.rule34_user_id
+                    params["api_key"] = self.config.rule34_api_key
 
-            response = requests.get(
-                "https://api.rule34.xxx",
-                params=params,
-                headers=self.config.headers,
-                timeout=15,
-            )
-            if response.status_code == 200:
+                response = requests.get(
+                    "https://api.rule34.xxx",
+                    params=params,
+                    headers=self.config.headers,
+                    timeout=15,
+                )
+                if response.status_code != 200:
+                    continue
+
                 data = response.json()
-                if isinstance(data, list):
-                    for post in data:
-                        post_tags = post.get("tags", "")
-                        if self.get_matching_blacklist_tags(post_tags):
-                            continue
-                        url = post.get("file_url")
-                        if url:
-                            results.append(
-                                {
-                                    "url": url,
-                                    "tags": post_tags,
-                                    "api": "rule34",
-                                    "query_tag": query_tag or "random",
-                                }
-                            )
+                if not isinstance(data, list):
+                    continue
+
+                for post in data:
+                    post_tags = post.get("tags", "")
+                    if self.get_matching_blacklist_tags(post_tags):
+                        continue
+                    url = post.get("file_url")
+                    if not url or url in seen_rule34_urls:
+                        continue
+                    seen_rule34_urls.add(url)
+                    results.append(
+                        {
+                            "url": url,
+                            "tags": post_tags,
+                            "api": "rule34",
+                            "query_tag": query_tag or "random",
+                        }
+                    )
+
+                if results:
+                    break
         except Exception as e:
             log_verbose(f"Buffer fetch error rule34 ({query_tag or 'random'}): {e}")
 
