@@ -1767,7 +1767,7 @@ class ChatWindow(QMainWindow):
             if attachment:
                 file_type = str(attachment.get("file_type") or "").lower()
                 filename = str(attachment.get("filename") or "")
-                ext = Path(filename).suffix.lower()
+                ext = Path(filename).suffix.lower() or ".jpg"
                 is_image_file = (
                     file_type.startswith("image/")
                     or ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -1798,7 +1798,7 @@ class ChatWindow(QMainWindow):
         if file_url and file_url.startswith("/"):
             file_url = f"{self.server_url}{file_url}"
         elif file_url and not file_url.lower().startswith(("http://", "https://")):
-            file_url = f"{self.server_url}/{file_url.lstrip('/')}"
+            file_url = f"{self.server_url.rstrip('/')}/{file_url.lstrip('/')}"
 
         if not file_url and file_id is not None:
             file_url = f"{self.server_url}/api/files/{file_id}"
@@ -2012,6 +2012,7 @@ class ChatWindow(QMainWindow):
 
     def append_chat_message(self, username: str, content: str, msg_type: str = "text", attachment: Optional[Dict] = None):
         """Append one formatted message to the chat display."""
+        print(f"[DEBUG] Appending message: username={username!r}, content={content!r}, msg_type={msg_type!r}, attachment={attachment!r}")
         if self._is_duplicate_presence_message(content, msg_type):
             return
 
@@ -2056,6 +2057,7 @@ class ChatWindow(QMainWindow):
 
     def _schedule_chat_rebuild(self):
         """Debounced full-document rebuild — coalesces multiple concurrent image downloads."""
+        print(f"[DEBUG] _schedule_chat_rebuild called")
         if not hasattr(self, "_rebuild_timer"):
             self._rebuild_timer = QTimer(self)
             self._rebuild_timer.setSingleShot(True)
@@ -2064,17 +2066,42 @@ class ChatWindow(QMainWindow):
 
     def _rebuild_chat_display(self):
         """Rebuild the chat display from _chat_raw_messages using any cached images."""
+        print(f"[DEBUG] _rebuild_chat_display called. Message count: {len(self._chat_raw_messages)}")
         scrollbar = self.message_display.verticalScrollBar()
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 20
         self.message_display.clear()
+
+        # Pass 1: Collect all image URLs that are not yet cached
+        uncached_urls = set()
+        for msg in self._chat_raw_messages:
+            t = msg.get("msg_type") or msg.get("message_type", "text")
+            if t == "system":
+                continue
+            c = msg.get("content", "")
+            urls = self._extract_image_urls(c)
+            for url in urls:
+                if url not in self._image_cache:
+                    uncached_urls.add(url)
+
+        # Fetch/cache any missing images synchronously (history only, not for live messages)
+        if uncached_urls:
+            print(f"[DEBUG] Caching {len(uncached_urls)} uncached image URLs for history: {uncached_urls}")
+            for url in uncached_urls:
+                self._cache_image_url(url)
+
+        # Pass 2: Render all messages
         for msg in list(self._chat_raw_messages):
-            u = msg["username"]
-            c = msg["content"]
-            t = msg["msg_type"]
+            u = msg.get("username", "Unknown")
+            c = msg.get("content", "")
+            t = msg.get("msg_type") or msg.get("message_type", "text")
             urls = self._extract_image_urls(c) if t != "system" else []
             sources = {url: self._image_cache[url] for url in urls if url in self._image_cache}
             body_html = self._build_message_body_html(c, sources)
-            self.message_display.append(self.format_message_html(u, body_html, t))
+            if urls:
+                print(f"[DEBUG] Image message for {u}: urls={urls}, sources={list(sources.keys())}, body_html={body_html}")
+            html_line = self.format_message_html(u, body_html, t)
+            print(f"[DEBUG] Appending to chat display: {html_line}")
+            self.message_display.append(html_line)
         if was_at_bottom:
             scrollbar.setValue(scrollbar.maximum())
 
@@ -2103,6 +2130,7 @@ class ChatWindow(QMainWindow):
     
     def _run_in_bg(self, fn, callback, *args):
         """Run fn(*args) in a background thread, call callback(result) on the main thread."""
+        print("IN _run_in_bg, fn:", fn.__name__, "args:", args)
         worker = WorkerThread(fn, *args)
         worker.result.connect(callback)
         worker.finished.connect(lambda: self._workers.remove(worker) if worker in self._workers else None)
@@ -2185,17 +2213,22 @@ class ChatWindow(QMainWindow):
             self.websocket_thread = None
 
         def _fetch(rid):
+            print("IN on_room_selected _fetch, rid:", rid)
             ok_join, _ = self.api_client.join_room(rid)
             if not ok_join:
+                print("join_room failed")
                 return None
             ok_msgs, messages = self.api_client.get_messages(rid, limit=50)
             ok_mbrs, members = self.api_client.get_room_members(rid)
+            print("Fetched messages:", messages)
+            print("Fetched members:", members)
             return {
                 "messages": messages if ok_msgs else [],
                 "members": members if ok_mbrs else [],
             }
 
         def _apply(result):
+            print("IN on_room_selected _apply, result:", result)  # DEBUG: Print result
             if self._room_select_epoch != epoch:
                 return  # stale callback — a newer room was selected, discard
             if result is None:
@@ -2212,12 +2245,16 @@ class ChatWindow(QMainWindow):
                 content = self._display_content_from_message(msg)
                 attachment = self._extract_attachment_from_message(msg)
                 self.append_chat_message(username, content, msg_type, attachment)
+            self._schedule_chat_rebuild()  # Ensure UI is rebuilt after loading messages
             self._update_members(result["members"])
             self.connect_websocket()
 
+        print("IN on_room_selected, calling _run_in_bg with room_id:", room_id)
         self._run_in_bg(_fetch, _apply, room_id)
 
     def load_messages(self):
+        def _apply(messages):
+            print("IN _apply, messages param:", messages)  # <-- Add this as the first line
         """Reload message history for current room in background."""
         if not self.current_room:
             return
@@ -2225,6 +2262,7 @@ class ChatWindow(QMainWindow):
             ok, msgs = self.api_client.get_messages(rid, limit=50)
             return msgs if ok else []
         def _apply(messages):
+            print("Loaded messages:", messages)  # DEBUG: Print loaded messages
             self.message_display.clear()
             self._chat_raw_messages.clear()
             self._seen_live_message_keys.clear()
@@ -2236,6 +2274,7 @@ class ChatWindow(QMainWindow):
                 content = self._display_content_from_message(msg)
                 attachment = self._extract_attachment_from_message(msg)
                 self.append_chat_message(username, content, msg_type, attachment)
+            self._schedule_chat_rebuild()  # Ensure UI is rebuilt after loading messages
         self._run_in_bg(_fetch, _apply, self.current_room)
     
     def send_message(self):
@@ -2952,15 +2991,11 @@ class ChatWindow(QMainWindow):
 
             def _apply_create_room(result):
                 success, payload = result if result else (False, "Request failed")
-                if not success:
-                    self.append_system_message(f"Create room failed: {payload}")
-                    return
-
-                self.append_system_message(
-                    f"Room created: {payload.get('name', room_name)}"
-                    f" ({'private' if is_private else 'public'})"
-                )
-                self.refresh_rooms()
+                if success:
+                    QMessageBox.information(self, "Success", "Room created")
+                    self.refresh_rooms()
+                else:
+                    QMessageBox.critical(self, "Error", str(payload))
 
             self._run_in_bg(self.api_client.create_room, _apply_create_room, room_name, is_private)
             return
@@ -3120,11 +3155,25 @@ class ChatWindow(QMainWindow):
             def _fetch_upload(rid, path):
                 return self.api_client.upload_file(rid, path)
 
+
             def _apply_upload(result):
                 success, payload = result if result else (False, "Upload failed")
                 if success:
                     self._remember_uploaded_image_url(payload)
                     uploaded_name = str(payload.get("filename") or Path(file_path).name)
+                    # Immediately append the uploaded message to the chat
+                    msg_type = payload.get("message_type", "file")
+                    username = self.api_client.username or "You"
+                    content = payload.get("content") or ("[Image]" if msg_type == "image" else f"[File] {uploaded_name}")
+                    attachment = {
+                        "file_id": payload.get("file_id"),
+                        "file_url": payload.get("file_url"),
+                        "filename": uploaded_name,
+                        "file_type": payload.get("file_type"),
+                        "file_size": payload.get("file_size"),
+                        "message_type": msg_type,
+                    }
+                    self.append_chat_message(username, content, msg_type, attachment)
                     QMessageBox.information(self, "Success", f"File uploaded: {uploaded_name}")
                     if room_id == self.current_room:
                         self.load_messages()

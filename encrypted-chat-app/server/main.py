@@ -1102,6 +1102,12 @@ async def get_messages(
     ).order_by(Message.created_at.desc()).offset(offset).limit(limit).all()
 
     print(f"[DEBUG] get_messages: fetched {len(messages)} messages for room {room_id}")
+    for msg in messages:
+        try:
+            decrypted = encryption_manager.decrypt_message(room_id, msg.content)
+        except Exception as e:
+            decrypted = f"[DECRYPT ERROR] {e}"
+        print(f"[DEBUG] Message id={msg.id} type={msg.message_type} user={msg.user_id} content={decrypted} files={[f.id for f in getattr(msg, 'files', [])]}")
 
     result = []
     # Always use request.base_url for file_url if possible
