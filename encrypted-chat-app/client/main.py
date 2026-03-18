@@ -1027,6 +1027,24 @@ class LoginDialog(QDialog):
             QMessageBox.critical(self, "Registration Failed", str(result))
 
 
+class ChatBrowser(QTextBrowser):
+    """QTextBrowser that serves images from an in-memory bytes store via loadResource,
+    avoiding large base64 data URIs in the HTML document."""
+
+    # Class-level bytes store: {"chatimg://<key>": bytes}
+    _image_store: Dict[str, bytes] = {}
+
+    def loadResource(self, resource_type, url):
+        if resource_type == 2:  # QTextDocument.ResourceType.ImageResource
+            data = ChatBrowser._image_store.get(url.toString())
+            if data is not None:
+                from PyQt6.QtGui import QImage
+                img = QImage()
+                img.loadFromData(data)
+                return img
+        return super().loadResource(resource_type, url)
+
+
 class ChatWindow(QMainWindow):
     """Main chat window."""
     
@@ -1149,7 +1167,7 @@ class ChatWindow(QMainWindow):
         self.chat_splitter.setHandleWidth(8)
         self.chat_splitter.setOpaqueResize(True)
 
-        self.message_display = QTextBrowser()
+        self.message_display = ChatBrowser()
         self.message_display.setObjectName("ChatDisplay")
         self.message_display.setMinimumHeight(0)
         self.message_display.setReadOnly(True)
@@ -1834,7 +1852,7 @@ class ChatWindow(QMainWindow):
         }
 
     def _cache_image_url(self, url: str) -> Optional[str]:
-        """Fetch one image and return in-memory data URI for embedding (no disk writes)."""
+        """Fetch one image, store raw bytes in ChatBrowser resource store, return proxy URI."""
         if url in self._image_cache:
             return self._image_cache[url]
 
@@ -1842,21 +1860,11 @@ class ChatWindow(QMainWindow):
             response = requests.get(url, timeout=8)
             response.raise_for_status()
 
-            content_type = (response.headers.get("content-type") or "").lower()
-            mime_type = "image/jpeg"
-            if "png" in content_type:
-                mime_type = "image/png"
-            elif "gif" in content_type:
-                mime_type = "image/gif"
-            elif "webp" in content_type:
-                mime_type = "image/webp"
-            elif "jpeg" in content_type or "jpg" in content_type:
-                mime_type = "image/jpeg"
-
-            encoded = base64.b64encode(response.content).decode("ascii")
-            data_uri = f"data:{mime_type};base64,{encoded}"
-            self._image_cache[url] = data_uri
-            return data_uri
+            import hashlib
+            key = "chatimg://" + hashlib.md5(url.encode()).hexdigest()
+            ChatBrowser._image_store[key] = response.content
+            self._image_cache[url] = key
+            return key
         except Exception:
             return None
 
