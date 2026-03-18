@@ -1551,16 +1551,21 @@ async def bot_stream_status(
 @app.websocket("/ws/rooms/{room_id}/{token}")
 async def websocket_endpoint(room_id: int, token: str, websocket: WebSocket):
     """WebSocket endpoint for real-time messaging."""
+    client_host = getattr(websocket.client, "host", "unknown") if websocket.client else "unknown"
+    print(f"WebSocket connect attempt: room={room_id} client={client_host}")
+
     # Verify user
     db = next(get_db())
     user, error = auth_manager.verify_token(db, token)
     if error:
+        print(f"WebSocket reject: room={room_id} client={client_host} reason=invalid_token detail={error}")
         await websocket.close(code=4001, reason="Invalid token")
         return
     
     # Check room exists
     room = db.query(Room).filter(Room.id == room_id).first()
     if not room:
+        print(f"WebSocket reject: room={room_id} user={user.username} client={client_host} reason=room_not_found")
         await websocket.close(code=4004, reason="Room not found")
         return
     
@@ -1571,12 +1576,25 @@ async def websocket_endpoint(room_id: int, token: str, websocket: WebSocket):
     ).first()
     if not member:
         if room.is_private and room.created_by != user.id:
+            print(
+                f"WebSocket reject: room={room_id} user={user.username} client={client_host} "
+                f"reason=private_room_not_member"
+            )
             await websocket.close(code=4003, reason="Not a member of this room")
             return
         if not room.is_private:
+            print(
+                f"WebSocket auto-join: room={room_id} user={user.username} client={client_host} "
+                f"reason=public_room_missing_membership"
+            )
             member = RoomMember(user_id=user.id, room_id=room_id)
             db.add(member)
             db.commit()
+
+    print(
+        f"WebSocket accept: room={room_id} user={user.username} client={client_host} "
+        f"private={room.is_private}"
+    )
     
     became_online = await manager.connect(websocket, room_id, user.id)
 
