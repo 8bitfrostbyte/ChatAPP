@@ -1046,8 +1046,8 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
-        # Persistent image cache for the session (URL -> chatimg://key)
-        _global_image_cache = {}
+    # Persistent image cache for the session (URL -> chatimg://key)
+    _global_image_cache = {}
     """Main chat window."""
     
     def __init__(self, server_url: str):
