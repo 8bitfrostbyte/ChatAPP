@@ -2268,13 +2268,26 @@ class ChatWindow(QMainWindow):
             self._last_presence_message = None
             self._last_presence_at = 0
             deduped_messages = self._dedupe_presence_history(messages)
+            html_lines = []
             for msg in deduped_messages:
                 self._seen_live_message_keys.add(self._message_event_key(msg))
                 username = msg.get("username", "Unknown")
                 msg_type = msg.get("message_type", "text")
                 content = self._display_content_from_message(msg)
                 attachment = self._extract_attachment_from_message(msg)
-                self.append_chat_message(username, content, msg_type, attachment)
+                # Build HTML for each message (same as append_chat_message, but do not append)
+                image_urls = set(self._extract_image_urls(content))
+                if attachment and attachment.get("file_url"):
+                    file_url = attachment["file_url"]
+                    file_type = (attachment.get("file_type") or "").lower()
+                    if file_type.startswith("image/") or any(file_url.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]):
+                        image_urls.add(file_url)
+                sources = {url: self._image_cache[url] for url in image_urls if url in self._image_cache}
+                body_html = self._build_message_body_html(content, sources)
+                html_line = self.format_message_html(username, body_html, msg_type)
+                html_lines.append(html_line)
+            # Set all messages at once for performance
+            self.message_display.setHtml("\n".join(html_lines))
             self._schedule_chat_rebuild()  # Ensure UI is rebuilt after loading messages
         self._run_in_bg(_fetch, _apply, self.current_room)
     
