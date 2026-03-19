@@ -461,10 +461,6 @@ async def startup():
         db.commit()
         db.refresh(room_one)
 
-    # Ensure every room has a persistent key and load into memory.
-    all_rooms = db.query(Room).all()
-    for room in all_rooms:
-        ensure_room_encryption_key(db, room)
 
     # Remove any previously soft-deleted rows/files from older builds.
     _purge_soft_deleted_messages(db)
@@ -607,7 +603,6 @@ async def create_room(
     db.add(room)
     db.commit()
     db.refresh(room)
-    ensure_room_encryption_key(db, room)
 
     # Creator is automatically a member so private rooms are usable right away.
     creator_member = db.query(RoomMember).filter(
