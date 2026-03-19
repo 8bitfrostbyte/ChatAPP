@@ -2331,8 +2331,10 @@ class ChatWindow(QMainWindow):
                 html_line = self.format_message_html(username, body_html, msg_type)
                 html_lines.append(html_line)
             print(f"[DEBUG] load_messages: generated {len(html_lines)} html lines")
+            html_content = "\n".join(html_lines)
+            print(f"[DEBUG] Setting chat display HTML:\n{html_content}")
             # Set all messages at once for performance
-            self.message_display.setHtml("\n".join(html_lines))
+            self.message_display.setHtml(html_content)
             self._schedule_chat_rebuild()  # Ensure UI is rebuilt after loading messages
         self._run_in_bg(_fetch, _apply, self.current_room)
     
