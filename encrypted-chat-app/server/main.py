@@ -24,6 +24,47 @@ class ConnectionManager:
             except Exception:
                 pass
 
+
+
+
+
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, File, UploadFile, Query, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from datetime import datetime
+from typing import List, Optional, Dict
+import os
+import shutil
+import random
+import mimetypes
+import re
+
+# Initialize FastAPI app and CORS middleware at the top
+app = FastAPI(title="Encrypted Chat API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+import time
+from pathlib import Path
+from contextlib import suppress
+import requests
+
+# Import our modules
+from database import (
+    init_db, get_db, SessionLocal, User, Room, RoomMember, RoomInvite, Message, File as DBFile, Session as DBSession
+)
+from auth import (
+    auth_manager, UserRegisterRequest, UserLoginRequest, UserResponse, SessionResponse
+)
+from image_bot import image_bot
+import asyncio
+
+
 manager = ConnectionManager()
 
 @app.websocket("/ws/rooms/{room_id}")
@@ -67,44 +108,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
     except WebSocketDisconnect:
         manager.disconnect(room_id, websocket)
 
-
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, File, UploadFile, Query, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
-from datetime import datetime
-from typing import List, Optional, Dict
-import os
-import shutil
-import random
-import mimetypes
-import re
-import time
-from pathlib import Path
-from contextlib import suppress
-import requests
-
-# Import our modules
-from database import (
-    init_db, get_db, SessionLocal, User, Room, RoomMember, RoomInvite, Message, File as DBFile, Session as DBSession
-)
-from auth import (
-    auth_manager, UserRegisterRequest, UserLoginRequest, UserResponse, SessionResponse
-)
-from image_bot import image_bot
-import asyncio
-
-# Initialize FastAPI app
-app = FastAPI(title="Encrypted Chat API", version="1.0.0")
-
-# Add CORS middleware for cross-origin requests
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Create uploads directory
 UPLOAD_DIR = Path("uploads")
@@ -363,7 +366,7 @@ class BotStreamManager:
             message = Message(
                 room_id=room_id,
                 user_id=bot_user_id,
-                content=encrypted_content,
+                content=content,
                 message_type="bot"
             )
             db.add(message)
@@ -754,7 +757,7 @@ async def make_room_private(
     system_msg = Message(
         room_id=room_id,
         user_id=user.id,
-        content=encryption_manager.encrypt_message(room_id, system_msg_text),
+        content=system_msg_text,
         message_type="system"
     )
     db.add(system_msg)
@@ -895,7 +898,7 @@ async def leave_room(
     system_msg = Message(
         room_id=room_id,
         user_id=user.id,
-        content=encryption_manager.encrypt_message(room_id, f"{user.username} is offline"),
+        content=f"{user.username} is offline",
         message_type="system"
     )
     db.add(system_msg)
@@ -970,7 +973,7 @@ async def invite_user_to_room(
     system_msg = Message(
         room_id=room_id,
         user_id=user.id,
-        content=encryption_manager.encrypt_message(room_id, system_msg_text),
+        content=system_msg_text,
         message_type="system"
     )
     db.add(system_msg)
@@ -1071,7 +1074,7 @@ async def respond_to_invite(
         db.add(Message(
             room_id=room.id,
             user_id=inviter.id,
-            content=encryption_manager.encrypt_message(room.id, notice),
+            content=notice,
             message_type="system"
         ))
         db.commit()
@@ -1349,7 +1352,7 @@ async def upload_file(
     message = Message(
         room_id=room_id,
         user_id=user.id,
-        content=encryption_manager.encrypt_message(room_id, message_text),
+        content=message_text,
         message_type=message_type
     )
     db.add(message)
@@ -1697,18 +1700,16 @@ async def websocket_endpoint(room_id: int, token: str, websocket: WebSocket):
                 continue
             
             if data.get("type") == "message":
-                # Encrypt and store message
-                encrypted_content = encryption_manager.encrypt_message(room_id, data.get("content", ""))
+                # Store message as plaintext
                 message = Message(
                     room_id=room_id,
                     user_id=user.id,
-                    content=encrypted_content,
+                    content=data.get("content", ""),
                     message_type="text"
                 )
                 db.add(message)
                 db.commit()
                 db.refresh(message)
-                
                 # Broadcast to all users in room
                 await manager.broadcast(room_id, {
                     "type": "message_new",
