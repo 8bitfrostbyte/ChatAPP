@@ -37,7 +37,6 @@ from PyQt6.QtGui import QDesktopServices
 
 from websocket_client import WebSocketClient
 from notification_handler import NotificationHandler
-from client_encryption import client_encryption_manager
 
 def _load_client_version(default: str = "1.0.0") -> str:
     """Load client version from packaged version.txt when available."""
@@ -1050,29 +1049,11 @@ class ChatBrowser(QTextBrowser):
 
 class ChatWindow(QMainWindow):
     def auto_join_default_room(self):
-        """Automatically join room 1 after login and set encryption key if present."""
+        """Automatically join room 1 after login (no encryption)."""
         try:
-            ok, join_response = self.api_client.join_room(1)
+            ok, _ = self.api_client.join_room(1)
             if ok:
                 print("Auto-joined room 1 after login.")
-                # Set encryption key if present in join_response
-                if isinstance(join_response, dict) and "key" in join_response:
-                    try:
-                        client_encryption_manager.set_room_key(1, join_response["key"])
-                        print("Set encryption key for room 1 after auto-join.")
-                    except Exception as e:
-                        print(f"Failed to set encryption key for room 1: {e}")
-                # Fallback: check messages for a key
-                ok_msgs, messages = self.api_client.get_messages(1, limit=5)
-                if ok_msgs and messages:
-                    for msg in messages:
-                        if isinstance(msg, dict) and "key" in msg:
-                            try:
-                                client_encryption_manager.set_room_key(1, msg["key"])
-                                print("Set encryption key for room 1 from message after auto-join.")
-                                break
-                            except Exception as e:
-                                print(f"Failed to set encryption key for room 1 from message: {e}")
         except Exception as e:
             print(f"Failed to auto-join room 1: {e}")
 
@@ -2313,25 +2294,7 @@ class ChatWindow(QMainWindow):
             if not ok_join:
                 print("join_room failed")
                 return None
-            # Set encryption key if present in join_response
-            key_set = False
-            if isinstance(join_response, dict) and "key" in join_response:
-                try:
-                    client_encryption_manager.set_room_key(rid, join_response["key"])
-                    key_set = True
-                except Exception as e:
-                    print(f"Failed to set encryption key for room {rid}: {e}")
             ok_msgs, messages = self.api_client.get_messages(rid, limit=30)
-            # Fallback: check messages for a key if not set from join_response
-            if not key_set and ok_msgs and messages:
-                for msg in messages:
-                    if isinstance(msg, dict) and "key" in msg:
-                        try:
-                            client_encryption_manager.set_room_key(rid, msg["key"])
-                            print(f"Set encryption key for room {rid} from message after join.")
-                            break
-                        except Exception as e:
-                            print(f"Failed to set encryption key for room {rid} from message: {e}")
             ok_mbrs, members = self.api_client.get_room_members(rid)
             print("Fetched messages:", messages)
             print("Fetched members:", members)
@@ -2418,12 +2381,8 @@ class ChatWindow(QMainWindow):
         content = self.message_input.text().strip()
         if not content:
             return
-        # Encrypt message content for E2EE
-        try:
-            encrypted_content = client_encryption_manager.encrypt(self.current_room, content)
-        except Exception as e:
-            self.append_system_message(f"Encryption error: {e}")
-            return
+        # No encryption, send plain content
+        encrypted_content = content
 
         first_token = content.split(maxsplit=1)[0].lower()
 
@@ -3370,12 +3329,8 @@ class ChatWindow(QMainWindow):
 
         username = data.get("username", "Unknown")
         msg_type = data.get("message_type", "text")
-        # Decrypt message content for E2EE
-        try:
-            decrypted_content = client_encryption_manager.decrypt(self.current_room, data.get("content", ""))
-        except Exception as e:
-            decrypted_content = f"[Decryption error: {e}]"
-        content = self._display_content_from_message({**data, "content": decrypted_content})
+        # No decryption, use plain content
+        content = self._display_content_from_message(data)
         attachment = self._extract_attachment_from_message(data)
 
         self.append_chat_message(username, content, msg_type, attachment)
