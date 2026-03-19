@@ -4146,8 +4146,15 @@ class ChatWindow(QMainWindow):
 class ChatApp(QApplication):
     """Main application class."""
     
-    def __init__(self, argv, server_url: str = "http://localhost:8000"):
+    def __init__(self, argv, server_url: str = None):
         super().__init__(argv)
+        # Prompt for server URL at startup
+        last_url = _load_saved_server_url("http://localhost:8000")
+        url, ok = QInputDialog.getText(None, "Server URL", "Enter server URL:", text=last_url)
+        if not ok or not url.strip():
+            sys.exit(0)
+        server_url = url.strip()
+        _save_server_url(server_url)
         api_client = APIClient(server_url)
         self.window = ChatWindow(server_url=server_url, api_client=api_client)
         if not self.window.show_login():
