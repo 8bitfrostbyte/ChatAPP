@@ -780,8 +780,18 @@ async def join_room(
         RoomMember.user_id == user.id,
         RoomMember.room_id == room_id
     ).first()
+    # Always include the encryption key in the response
+    from .encryption import encryption_manager
+    key = None
+    if hasattr(room, 'encryption_key') and room.encryption_key:
+        key = room.encryption_key.decode() if isinstance(room.encryption_key, bytes) else str(room.encryption_key)
+    else:
+        # Ensure key exists in DB and memory
+        from .main import ensure_room_encryption_key
+        key_bytes = ensure_room_encryption_key(db, room)
+        key = key_bytes.decode() if isinstance(key_bytes, bytes) else str(key_bytes)
     if existing:
-        return {"message": "Already a member of this room"}
+        return {"message": "Already a member of this room", "key": key}
 
     # Private rooms are invite-only (creator can auto-manage membership).
     if room.is_private and room.created_by != user.id:
@@ -813,7 +823,7 @@ async def join_room(
         "message": f"{user.username} is online"
     })
     
-    return {"message": "Joined room successfully"}
+    return {"message": "Joined room successfully", "key": key}
 
 
 @app.post("/api/rooms/{room_id}/leave")
