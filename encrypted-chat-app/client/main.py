@@ -1049,16 +1049,27 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
+
+    def set_busy(self, busy, message=None):
+        # Stub: implement busy indicator if needed
+        pass
+
     _busy = False
     # Persistent image cache for the session (URL -> chatimg://key)
     _global_image_cache = {}
 
-    def _on_load_more_clicked(self):
-        self.load_more_messages()
     def __init__(self, *args, server_url=None, api_client=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self._workers = []  # Prevent WorkerThread instances from being garbage-collected mid-run
+        self.current_room = None
         self.server_url = server_url
         self.api_client = api_client
+        self._room_list_snapshot = None
+        self._last_update_notice_version = None
+        self._chat_raw_messages = []
+        self._rooms_data = {}
+        self._room_select_epoch = 0
+        self._seen_live_message_keys = set()
         # Main widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1068,9 +1079,7 @@ class ChatWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Load More button (to be placed above message display)
-        self.load_more_btn = QPushButton("Load More")
-        self.load_more_btn.clicked.connect(self._on_load_more_clicked)
+        # No Load More button in UI; logic is triggered by scroll event
 
         # Header row (make widgets persistent attributes)
         self.header_widget = QWidget()
@@ -1150,7 +1159,6 @@ class ChatWindow(QMainWindow):
         self.chat_splitter.setChildrenCollapsible(True)
         self.chat_splitter.setHandleWidth(8)
         self.chat_splitter.setOpaqueResize(True)
-        self.chat_splitter.insertWidget(0, self.load_more_btn)
 
         self.message_display = ChatBrowser()
         self.message_display.setObjectName("ChatDisplay")
