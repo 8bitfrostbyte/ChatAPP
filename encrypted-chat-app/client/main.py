@@ -1046,6 +1046,8 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
+        # Persistent image cache for the session (URL -> chatimg://key)
+        _global_image_cache = {}
     """Main chat window."""
     
     def __init__(self, server_url: str):
@@ -1056,7 +1058,7 @@ class ChatWindow(QMainWindow):
         self.websocket_thread = None
         self.notification_handler = NotificationHandler(self)
         self.sidebar_collapsed = False
-        self._image_cache = {}
+        self._image_cache = ChatWindow._global_image_cache
         self._chat_raw_messages = []
         self._last_presence_message = None
         self._last_presence_at = 0.0
@@ -1334,10 +1336,17 @@ class ChatWindow(QMainWindow):
 
     def check_for_updates(self, manual: bool = False, done_callback=None):
         """Check server-managed GitHub update status and announce in-app when available."""
+        if ChatWindow._busy:
+            self.append_system_message("Please wait: another operation is in progress.")
+            if done_callback:
+                done_callback(False, "Busy")
+            return
+        self.set_busy(True, "Checking for updates...")
         def _fetch(version_text):
             return self.api_client.check_for_update(version_text)
 
         def _apply(result):
+            self.set_busy(False)
             success, payload = result if result else (False, "Update check failed")
             if success and isinstance(payload, dict):
                 self._pending_update_info = payload
@@ -1347,7 +1356,6 @@ class ChatWindow(QMainWindow):
                     if done_callback:
                         done_callback(True, payload)
                     return
-
                 latest = str(payload.get("latest_version", "")).strip()
                 if payload.get("update_available") and latest and latest != self._last_update_notice_version:
                     self._last_update_notice_version = latest
@@ -1359,7 +1367,6 @@ class ChatWindow(QMainWindow):
             else:
                 if manual:
                     self.append_system_message(f"Update check failed: {payload}")
-
             if done_callback:
                 done_callback(success, payload)
 
@@ -1367,6 +1374,12 @@ class ChatWindow(QMainWindow):
 
     def install_update_from_server(self, done_callback=None):
         """Download latest update via server; replace EXE on restart when packaged."""
+        if ChatWindow._busy:
+            self.append_system_message("Please wait: another operation is in progress.")
+            if done_callback:
+                done_callback(False, "Busy")
+            return
+        self.set_busy(True, "Downloading update...")
         latest = str(self._pending_update_info.get("latest_version", "")).strip() or "latest"
 
         if getattr(sys, "frozen", False):
@@ -1377,6 +1390,7 @@ class ChatWindow(QMainWindow):
                 return self.api_client.download_update_file(str(target_path))
 
             def _apply(result):
+                self.set_busy(False)
                 progress_state["done"] = True
                 success, payload = result if result else (False, "Update download failed")
                 if not success:
@@ -1384,7 +1398,6 @@ class ChatWindow(QMainWindow):
                     if done_callback:
                         done_callback(False, payload)
                     return
-
                 updater_bat = Path(tempfile.gettempdir()) / f"encrypted_chat_update_{os.getpid()}.bat"
                 script = (
                     "@echo off\n"
@@ -1447,17 +1460,19 @@ class ChatWindow(QMainWindow):
             return self.api_client.download_update_file(str(target_path))
 
         def _apply_source(result):
+            self.set_busy(False)
             success, payload = result if result else (False, "Update download failed")
-            if success:
-                self.append_system_message(f"Update downloaded: {output_file}")
-            else:
+            if not success:
                 self.append_system_message(f"Update download failed: {payload}")
+                if done_callback:
+                    done_callback(False, payload)
+                return
+            self.append_system_message(f"Update v{latest} downloaded to {output_file}. Please install manually.")
             if done_callback:
-                done_callback(success, payload)
+                done_callback(True, payload)
 
         self._run_in_bg(_fetch_source, _apply_source, output_file)
 
-    @staticmethod
     def _is_hex_color(value: str) -> bool:
         return bool(re.fullmatch(r"#[0-9a-fA-F]{6}", str(value or "").strip()))
 
