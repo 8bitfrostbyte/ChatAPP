@@ -1049,10 +1049,51 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
-    # Typing indicator label (must be initialized before use in composer)
-    self.typing_indicator_label = QLabel("")
-    self.typing_indicator_label.setObjectName("TypingIndicatorLabel")
-    self.typing_indicator_label.setMinimumHeight(0)
+
+    def show_login(self) -> bool:
+        """Show login dialog. Returns True only on successful login."""
+        dialog = LoginDialog(self.api_client, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.user_label.setText(f"User: {self.api_client.username}")
+            self.setWindowTitle(f"Encrypted Chat - {self.api_client.username}")
+            self.refresh_rooms()
+            self.auto_join_default_room()
+            self.check_pending_private_invites()
+
+            self.invites_check_timer = QTimer(self)
+            self.invites_check_timer.setInterval(10000)
+            self.invites_check_timer.timeout.connect(self.check_pending_private_invites)
+            self.invites_check_timer.start()
+
+            self.check_for_updates(manual=False)
+
+            self.update_check_timer = QTimer(self)
+            self.update_check_timer.setInterval(15 * 60 * 1000)
+            self.update_check_timer.timeout.connect(lambda: self.check_for_updates(manual=False))
+            self.update_check_timer.start()
+
+            # Ensure window and layout are visible after login
+            self.show()
+            self.raise_()
+            self.update()
+            return True
+        return False
+
+    def _update_typing_indicator_style(self):
+        """Update the typing indicator label style to match the current theme."""
+        if hasattr(self, 'typing_indicator_label') and hasattr(self, '_theme'):
+            t = self._theme
+            style = f"""
+                QLabel#TypingIndicatorLabel {{
+                    color: {t.get('typing_indicator_fg', t.get('text_fg', '#FFFFFF'))};
+                    background: {t.get('typing_indicator_bg', t.get('window_bg', '#222'))};
+                    font-style: italic;
+                    padding: 2px 8px;
+                    border-radius: 6px;
+                }}
+            """
+            self.typing_indicator_label.setStyleSheet(style)
+
 
     def set_busy(self, busy, message=None):
         # Stub: implement busy indicator if needed
@@ -1064,6 +1105,10 @@ class ChatWindow(QMainWindow):
 
     def __init__(self, *args, server_url=None, api_client=None, **kwargs):
         super().__init__(*args, **kwargs)
+        # Typing indicator label (must be initialized after QApplication)
+        self.typing_indicator_label = QLabel("")
+        self.typing_indicator_label.setObjectName("TypingIndicatorLabel")
+        self.typing_indicator_label.setMinimumHeight(0)
         self._workers = []  # Prevent WorkerThread instances from being garbage-collected mid-run
         self.current_room = None
         self.server_url = server_url
@@ -1125,7 +1170,7 @@ class ChatWindow(QMainWindow):
         self.toggle_sidebar_btn.clicked.connect(self.toggle_sidebar)
         sidebar_header_layout.addWidget(rooms_label)
         sidebar_header_layout.addStretch(1)
-        sidebar_header_layout.addWidget(self.toggle_sidebar_btn)
+
         left_layout.addLayout(sidebar_header_layout)
 
         self.room_list = QListWidget()
@@ -1260,103 +1305,9 @@ class ChatWindow(QMainWindow):
         self.setGeometry(100, 100, 1000, 600)
         self.apply_dark_theme()
 
-def main():
-    app = QApplication([])
-    label = QLabel("PyQt6 minimal test")
-    label.show()
-    app.exec()
-
-if __name__ == "__main__":
-    main()
 
 
-    def load_more_messages(self):
-        """Fetch the next batch of older messages and prepend them to the chat."""
-        if not self.current_room:
-            return
-        # Determine how many messages are already loaded
-        current_count = len(self._chat_raw_messages)
-        batch_size = 100
-        def load_more_messages(self):
-            """Fetch the next batch of older messages and prepend them to the chat."""
-            if not self.current_room:
-                return
-            # Determine how many messages are already loaded
-            current_count = len(self._chat_raw_messages)
-            batch_size = 100
-            offset = current_count
-            ok, msgs = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
-            if not ok or not msgs:
-                self.append_system_message("No more messages to load.")
-                return
-            # Prepend new messages (older) to the start
-            self._chat_raw_messages = msgs + self._chat_raw_messages
-            self._schedule_chat_rebuild()
-        self.window_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.window_splitter.setChildrenCollapsible(True)
-        self.window_splitter.setHandleWidth(8)
-        self.window_splitter.setOpaqueResize(True)
-        self.window_splitter.addWidget(self.header_widget)
-        self.window_splitter.addWidget(self.main_splitter)
-        self.window_splitter.setCollapsible(0, True)
-        self.window_splitter.setCollapsible(1, True)
-        self.window_splitter.setStretchFactor(0, 0)
-        self.window_splitter.setStretchFactor(1, 1)
-        self.window_splitter.setSizes([28, 572])
 
-        main_layout = QVBoxLayout()
-        main_layout.addWidget(self.window_splitter)
-        central_widget = QWidget()
-        central_widget.setLayout(main_layout)
-        self.setCentralWidget(central_widget)
-        
-        # Prevent WorkerThread instances from being garbage-collected mid-run
-        self._workers = []
-
-        # Refresh rooms in a background thread so the UI never blocks
-        self.room_refresh_thread = RoomRefreshThread(self.api_client)
-        self.room_refresh_thread.rooms_fetched.connect(self._update_room_list)
-        self.room_refresh_thread.start()
-
-        # Keep room member list fresh even if a live WS presence event is missed.
-        self.members_refresh_timer = QTimer(self)
-        self.members_refresh_timer.setInterval(3000)
-        self.members_refresh_timer.timeout.connect(self.refresh_members)
-        self.members_refresh_timer.start()
-
-        # Ensure window and layout are visible
-        self.show()
-        self.raise_()
-        self.update()
-    
-    def show_login(self) -> bool:
-        """Show login dialog. Returns True only on successful login."""
-        dialog = LoginDialog(self.api_client, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.user_label.setText(f"User: {self.api_client.username}")
-            self.setWindowTitle(f"Encrypted Chat - {self.api_client.username}")
-            self.refresh_rooms()
-            self.auto_join_default_room()
-            self.check_pending_private_invites()
-
-            self.invites_check_timer = QTimer(self)
-            self.invites_check_timer.setInterval(10000)
-            self.invites_check_timer.timeout.connect(self.check_pending_private_invites)
-            self.invites_check_timer.start()
-
-            self.check_for_updates(manual=False)
-
-            self.update_check_timer = QTimer(self)
-            self.update_check_timer.setInterval(15 * 60 * 1000)
-            self.update_check_timer.timeout.connect(lambda: self.check_for_updates(manual=False))
-            self.update_check_timer.start()
-
-            # Ensure window and layout are visible after login
-            self.show()
-            self.raise_()
-            self.update()
-            return True
-        return False
 
     def check_pending_private_invites(self):
         """Poll pending invites and prompt user to accept/decline."""
