@@ -1049,6 +1049,10 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
+    # Typing indicator label (must be initialized before use in composer)
+    self.typing_indicator_label = QLabel("")
+    self.typing_indicator_label.setObjectName("TypingIndicatorLabel")
+    self.typing_indicator_label.setMinimumHeight(0)
 
     def set_busy(self, busy, message=None):
         # Stub: implement busy indicator if needed
@@ -1070,6 +1074,12 @@ class ChatWindow(QMainWindow):
         self._rooms_data = {}
         self._room_select_epoch = 0
         self._seen_live_message_keys = set()
+        self.websocket_thread = None
+        self._last_presence_message = None
+        self._last_presence_at = 0
+        self._image_cache = {}
+        self._pending_update_info = {}
+        self._seen_invite_ids = set()
         # Main widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1169,6 +1179,44 @@ class ChatWindow(QMainWindow):
         self.message_display.verticalScrollBar().valueChanged.connect(lambda _: self._on_chat_scrolled())
         self.chat_splitter.addWidget(self.message_display)
 
+        # --- Composer (typing box and buttons) ---
+        composer_widget = QWidget()
+        composer_widget.setMinimumHeight(0)
+        composer_layout = QVBoxLayout()
+        composer_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.message_input = QLineEdit()
+        self.message_input.setObjectName("ChatInput")
+        self.message_input.returnPressed.connect(self.send_message)
+        composer_layout.addWidget(self.typing_indicator_label)
+        composer_layout.addWidget(self.message_input)
+
+        button_layout = QHBoxLayout()
+        send_btn = QPushButton("Send")
+        send_btn.clicked.connect(self.send_message)
+        button_layout.addWidget(send_btn)
+
+        upload_btn = QPushButton("Upload File")
+        upload_btn.clicked.connect(self.upload_file_dialog)
+        button_layout.addWidget(upload_btn)
+
+        settings_btn = QPushButton("Settings")
+        settings_btn.clicked.connect(self.show_settings)
+        button_layout.addWidget(settings_btn)
+
+        logout_btn = QPushButton("Logout")
+        logout_btn.clicked.connect(self.logout)
+        button_layout.addWidget(logout_btn)
+
+        composer_layout.addLayout(button_layout)
+        composer_widget.setLayout(composer_layout)
+        self.chat_splitter.addWidget(composer_widget)
+        self.chat_splitter.setCollapsible(0, True)
+        self.chat_splitter.setCollapsible(1, True)
+        self.chat_splitter.setStretchFactor(0, 1)
+        self.chat_splitter.setStretchFactor(1, 0)
+        self.chat_splitter.setSizes([520, 120])
+
         self.chat_area_splitter = QSplitter(Qt.Orientation.Vertical)
         self.chat_area_splitter.setChildrenCollapsible(True)
         self.chat_area_splitter.setHandleWidth(8)
@@ -1220,84 +1268,21 @@ class ChatWindow(QMainWindow):
         # Determine how many messages are already loaded
         current_count = len(self._chat_raw_messages)
         batch_size = 100
-        offset = current_count
-        ok, msgs = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
-        if not ok or not msgs:
-            self.append_system_message("No more messages to load.")
-            return
-        # Prepend new messages (older) to the start
-        self._chat_raw_messages = msgs + self._chat_raw_messages
-        self._schedule_chat_rebuild()
-
-        composer_widget = QWidget()
-        composer_widget.setMinimumHeight(0)
-        composer_layout = QVBoxLayout()
-        composer_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.message_input = QLineEdit()
-        self.message_input.setObjectName("ChatInput")
-        self.message_input.returnPressed.connect(self.send_message)
-        composer_layout.addWidget(self.typing_indicator_label)
-        composer_layout.addWidget(self.message_input)
-
-        button_layout = QHBoxLayout()
-
-        send_btn = QPushButton("Send")
-        send_btn.clicked.connect(self.send_message)
-        button_layout.addWidget(send_btn)
-
-        upload_btn = QPushButton("Upload File")
-        upload_btn.clicked.connect(self.upload_file_dialog)
-        button_layout.addWidget(upload_btn)
-
-        settings_btn = QPushButton("Settings")
-        settings_btn.clicked.connect(self.show_settings)
-        button_layout.addWidget(settings_btn)
-
-        logout_btn = QPushButton("Logout")
-        logout_btn.clicked.connect(self.logout)
-        button_layout.addWidget(logout_btn)
-
-        composer_layout.addLayout(button_layout)
-        composer_widget.setLayout(composer_layout)
-        self.chat_splitter.addWidget(composer_widget)
-        self.chat_splitter.setCollapsible(0, True)
-        self.chat_splitter.setCollapsible(1, True)
-        self.chat_splitter.setStretchFactor(0, 1)
-        self.chat_splitter.setStretchFactor(1, 0)
-        self.chat_splitter.setSizes([520, 120])
-
-        # Top-edge drag support for message area (drag handle above messages).
-        self.chat_area_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.chat_area_splitter.setChildrenCollapsible(True)
-        self.chat_area_splitter.setHandleWidth(8)
-        self.chat_area_splitter.setOpaqueResize(True)
-        self.chat_area_splitter.addWidget(self.room_name_label)
-        self.chat_area_splitter.addWidget(self.chat_splitter)
-        self.chat_area_splitter.setCollapsible(0, True)
-        self.chat_area_splitter.setCollapsible(1, True)
-        self.chat_area_splitter.setStretchFactor(0, 0)
-        self.chat_area_splitter.setStretchFactor(1, 1)
-        self.chat_area_splitter.setSizes([34, 606])
-
-        # --- Fix: Ensure variables are defined before use ---
-        right_layout = QVBoxLayout()
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(self.chat_area_splitter)
-
-        chat_widget = QWidget()
-        chat_widget.setMinimumWidth(0)
-        chat_widget.setLayout(right_layout)
-
-        self.main_splitter.addWidget(self.sidebar_widget)
-        self.main_splitter.addWidget(chat_widget)
-        self.main_splitter.setCollapsible(0, True)
-        self.main_splitter.setCollapsible(1, True)
-        self.main_splitter.setStretchFactor(0, 0)
-        self.main_splitter.setStretchFactor(1, 1)
-        self.main_splitter.setSizes([280, 720])
-
-        # Global vertical splitter enables dragging from top edge too (collapse header).
+        def load_more_messages(self):
+            """Fetch the next batch of older messages and prepend them to the chat."""
+            if not self.current_room:
+                return
+            # Determine how many messages are already loaded
+            current_count = len(self._chat_raw_messages)
+            batch_size = 100
+            offset = current_count
+            ok, msgs = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
+            if not ok or not msgs:
+                self.append_system_message("No more messages to load.")
+                return
+            # Prepend new messages (older) to the start
+            self._chat_raw_messages = msgs + self._chat_raw_messages
+            self._schedule_chat_rebuild()
         self.window_splitter = QSplitter(Qt.Orientation.Vertical)
         self.window_splitter.setChildrenCollapsible(True)
         self.window_splitter.setHandleWidth(8)
@@ -1556,7 +1541,7 @@ class ChatWindow(QMainWindow):
 
         color_keys = {
             "window_bg", "panel_bg", "header_bg", "chat_bg", "input_bg", "border_color",
-            "text_color", "button_bg", "button_border", "button_text", "timestamp_color",
+            "text_color", "button_bg", "button_border",
             "link_color", "msg_own_name", "msg_other_name", "msg_own_text", "msg_other_text",
             "system_color",
         }
@@ -4212,36 +4197,7 @@ class ChatApp(QApplication):
 
 def main():
     """Main entry point."""
-    # Prompt for server URL
-    from PyQt6.QtWidgets import QInputDialog
-    
-    app_instance = QApplication(sys.argv)
-    
-    default_server_url = _load_saved_server_url("http://localhost:8000")
-
-    # Get server URL from user (or use saved/default)
-    server_url, ok = QInputDialog.getText(
-        None,
-        "Server Configuration",
-        "Server URL:",
-        text=default_server_url
-    )
-    
-    if not ok:
-        sys.exit(1)
-
-    entered_server_url = str(server_url or "").strip() or default_server_url
-    server_url = _normalize_server_url(entered_server_url, default_server_url)
-    _save_server_url(server_url)
-
-    if entered_server_url != server_url:
-        QMessageBox.information(
-            None,
-            "Server URL Updated",
-            f"Using normalized server URL:\n{server_url}"
-        )
-    
-    app = ChatApp(sys.argv, server_url)
+    app = ChatApp(sys.argv)
     sys.exit(app.exec())
 
 
