@@ -1050,11 +1050,29 @@ class ChatBrowser(QTextBrowser):
 
 class ChatWindow(QMainWindow):
     def auto_join_default_room(self):
-        """Automatically join room 1 after login."""
+        """Automatically join room 1 after login and set encryption key if present."""
         try:
-            ok, _ = self.api_client.join_room(1)
+            ok, join_response = self.api_client.join_room(1)
             if ok:
                 print("Auto-joined room 1 after login.")
+                # Set encryption key if present in join_response
+                if isinstance(join_response, dict) and "key" in join_response:
+                    try:
+                        client_encryption_manager.set_room_key(1, join_response["key"])
+                        print("Set encryption key for room 1 after auto-join.")
+                    except Exception as e:
+                        print(f"Failed to set encryption key for room 1: {e}")
+                # Fallback: check messages for a key
+                ok_msgs, messages = self.api_client.get_messages(1, limit=5)
+                if ok_msgs and messages:
+                    for msg in messages:
+                        if isinstance(msg, dict) and "key" in msg:
+                            try:
+                                client_encryption_manager.set_room_key(1, msg["key"])
+                                print("Set encryption key for room 1 from message after auto-join.")
+                                break
+                            except Exception as e:
+                                print(f"Failed to set encryption key for room 1 from message: {e}")
         except Exception as e:
             print(f"Failed to auto-join room 1: {e}")
 
@@ -2296,12 +2314,24 @@ class ChatWindow(QMainWindow):
                 print("join_room failed")
                 return None
             # Set encryption key if present in join_response
+            key_set = False
             if isinstance(join_response, dict) and "key" in join_response:
                 try:
                     client_encryption_manager.set_room_key(rid, join_response["key"])
+                    key_set = True
                 except Exception as e:
                     print(f"Failed to set encryption key for room {rid}: {e}")
             ok_msgs, messages = self.api_client.get_messages(rid, limit=30)
+            # Fallback: check messages for a key if not set from join_response
+            if not key_set and ok_msgs and messages:
+                for msg in messages:
+                    if isinstance(msg, dict) and "key" in msg:
+                        try:
+                            client_encryption_manager.set_room_key(rid, msg["key"])
+                            print(f"Set encryption key for room {rid} from message after join.")
+                            break
+                        except Exception as e:
+                            print(f"Failed to set encryption key for room {rid} from message: {e}")
             ok_mbrs, members = self.api_client.get_room_members(rid)
             print("Fetched messages:", messages)
             print("Fetched members:", members)
