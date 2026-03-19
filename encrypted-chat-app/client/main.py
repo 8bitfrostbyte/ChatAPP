@@ -2335,7 +2335,7 @@ class ChatWindow(QMainWindow):
             print(f"[DEBUG] Setting chat display HTML:\n{html_content}")
             # Set all messages at once for performance
             self.message_display.setHtml(html_content)
-            self._schedule_chat_rebuild()  # Ensure UI is rebuilt after loading messages
+            # Do NOT call _schedule_chat_rebuild here; it will clear the display
         self._run_in_bg(_fetch, _apply, self.current_room)
     
     def send_message(self):
