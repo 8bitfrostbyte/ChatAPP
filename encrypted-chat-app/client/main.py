@@ -1256,9 +1256,18 @@ class ChatWindow(QMainWindow):
         central_widget.setLayout(main_layout)
         self._theme = copy.deepcopy(_THEME_DEFAULTS)
         self._load_user_settings()
-        self.setWindowTitle("Encrypted Chat")
+        self.setWindowTitle("Encrypted Chat - Main Window")
         self.setGeometry(100, 100, 1000, 600)
         self.apply_dark_theme()
+
+def main():
+    app = QApplication([])
+    label = QLabel("PyQt6 minimal test")
+    label.show()
+    app.exec()
+
+if __name__ == "__main__":
+    main()
 
 
     def load_more_messages(self):
