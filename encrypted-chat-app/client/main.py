@@ -1473,6 +1473,7 @@ class ChatWindow(QMainWindow):
 
         self._run_in_bg(_fetch_source, _apply_source, output_file)
 
+    @staticmethod
     def _is_hex_color(value: str) -> bool:
         return bool(re.fullmatch(r"#[0-9a-fA-F]{6}", str(value or "").strip()))
 
