@@ -1046,12 +1046,9 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
-        _busy = False
+    _busy = False
     # Persistent image cache for the session (URL -> chatimg://key)
     _global_image_cache = {}
-    """Main chat window."""
-    
-    _busy = False
     """Main chat window."""
     
     def __init__(self, server_url: str):
@@ -1067,15 +1064,15 @@ class ChatWindow(QMainWindow):
         self._last_presence_message = None
         self._last_presence_at = 0.0
         self._seen_live_message_keys = set()
-        self._uploaded_image_urls_by_message_id: Dict[int, str] = {}
+        self._uploaded_image_urls_by_message_id = {}
         self._room_list_snapshot = []
-        self._rooms_data: Dict[int, dict] = {}  # room_id -> {is_private, created_by}
+        self._rooms_data = {}  # room_id -> {is_private, created_by}
         self._room_select_epoch = 0
         self._seen_invite_ids = set()
-        self._pending_update_info: Dict = {}
+        self._pending_update_info = {}
         self._last_update_notice_version = ""
         self.settings_path = self._resolve_settings_path()
-        self._theme: Dict = copy.deepcopy(_THEME_DEFAULTS)
+        self._theme = copy.deepcopy(_THEME_DEFAULTS)
         self._load_user_settings()
         
         self.setWindowTitle("Encrypted Chat")
@@ -2207,7 +2204,8 @@ class ChatWindow(QMainWindow):
             self._rooms_data[room["id"]] = {
                 "is_private": is_private,
                 "created_by": created_by,
-                "name": room["name"],
+                "name": room["name"]
+            }
            
     def on_room_selected(self, item):
         """Handle room selection — all network calls run in background."""
