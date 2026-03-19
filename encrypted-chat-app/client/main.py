@@ -34,8 +34,10 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QStandardPaths
 from PyQt6.QtGui import QIcon, QPixmap, QFont, QFontDatabase
 from PyQt6.QtGui import QDesktopServices
 
+
 from websocket_client import WebSocketClient
 from notification_handler import NotificationHandler
+from client_encryption import client_encryption_manager
 
 def _load_client_version(default: str = "1.0.0") -> str:
     """Load client version from packaged version.txt when available."""
@@ -456,7 +458,7 @@ class APIClient:
         except Exception as e:
             return False, []
     
-    def get_messages(self, room_id: int, limit: int = 500, offset: int = 0) -> tuple:
+    def get_messages(self, room_id: int, limit: int = 100, offset: int = 0) -> tuple:
         """Get message history."""
         try:
             response = requests.get(
@@ -1045,83 +1047,52 @@ class ChatBrowser(QTextBrowser):
         return super().loadResource(resource_type, url)
 
 
+
 class ChatWindow(QMainWindow):
     _busy = False
     # Persistent image cache for the session (URL -> chatimg://key)
     _global_image_cache = {}
-    """Main chat window."""
 
-    def set_busy(self, busy: bool, message: str = None):
-        """Set the busy state and optionally display a status message."""
-        ChatWindow._busy = busy
-        # Optionally, update the UI to reflect busy state
-        if hasattr(self, 'statusBar') and callable(getattr(self, 'statusBar', None)):
-            bar = self.statusBar()
-            if busy:
-                bar.showMessage(message or "Working...", 5000)
-            else:
-                bar.clearMessage()
-
-    def __init__(self, server_url: str):
-        super().__init__()
-        self.server_url = _normalize_server_url(server_url)
-        self.api_client = APIClient(self.server_url)
-        self.current_room = None
-        self.websocket_thread = None
-        self.notification_handler = NotificationHandler(self)
-        self.sidebar_collapsed = False
-        self._image_cache = ChatWindow._global_image_cache
-        self._chat_raw_messages = []
-        self._last_presence_message = None
-        self._last_presence_at = 0.0
-        self._seen_live_message_keys = set()
-        self._uploaded_image_urls_by_message_id = {}
-        self._room_list_snapshot = []
-        self._rooms_data = {}  # room_id -> {is_private, created_by}
-        self._room_select_epoch = 0
-        self._seen_invite_ids = set()
-        self._pending_update_info = {}
-        self._last_update_notice_version = ""
-        self.settings_path = self._resolve_settings_path()
-        self._theme = copy.deepcopy(_THEME_DEFAULTS)
-        self._load_user_settings()
-        
-        self.setWindowTitle("Encrypted Chat")
-        self.setGeometry(100, 100, 1000, 600)
-        
-        self.apply_dark_theme()
-
+    def _on_load_more_clicked(self):
+        self.load_more_messages()
+    def __init__(self, *args, server_url=None, api_client=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.server_url = server_url
+        self.api_client = api_client
         # Main widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         # Main layout
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Header row
-        header_widget = QWidget()
-        header_widget.setObjectName("HeaderBar")
-        header_widget.setMinimumHeight(0)
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(4, 4, 4, 2)
+        # Load More button (to be placed above message display)
+        self.load_more_btn = QPushButton("Load More")
+        self.load_more_btn.clicked.connect(self._on_load_more_clicked)
+
+        # Header row (make widgets persistent attributes)
+        self.header_widget = QWidget()
+        self.header_widget.setObjectName("HeaderBar")
+        self.header_widget.setMinimumHeight(0)
+        self.header_layout = QHBoxLayout()
+        self.header_layout.setContentsMargins(4, 4, 4, 2)
         self.user_label = QLabel("User: not logged in")
         self.user_label.setObjectName("HeaderUserLabel")
-        self.server_label = QLabel(f"Server: {self.server_url}")
+        self.server_label = QLabel(f"Server: {getattr(self, 'server_url', '')}")
         self.server_label.setObjectName("HeaderServerLabel")
-        header_layout.addWidget(self.user_label)
-        header_layout.addStretch(1)
-        header_layout.addWidget(self.server_label)
-        header_widget.setLayout(header_layout)
+        self.header_layout.addWidget(self.user_label)
+        self.header_layout.addStretch(1)
+        self.header_layout.addWidget(self.server_label)
+        self.header_widget.setLayout(self.header_layout)
 
         # Content layout with resizable splitter
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        # Allow dragging chat pane to full width by collapsing sibling pane.
         self.main_splitter.setChildrenCollapsible(True)
         self.main_splitter.setHandleWidth(8)
         self.main_splitter.setOpaqueResize(True)
-        
+
         # Left sidebar - Rooms
         self.sidebar_widget = QWidget()
         left_layout = QVBoxLayout()
@@ -1137,21 +1108,21 @@ class ChatWindow(QMainWindow):
         sidebar_header_layout.addStretch(1)
         sidebar_header_layout.addWidget(self.toggle_sidebar_btn)
         left_layout.addLayout(sidebar_header_layout)
-        
+
         self.room_list = QListWidget()
         self.room_list.itemClicked.connect(self.on_room_selected)
         left_layout.addWidget(self.room_list)
-        
+
         # Create room button
         create_room_btn = QPushButton("Create Room")
         create_room_btn.clicked.connect(self.create_room)
         left_layout.addWidget(create_room_btn)
-        
+
         # Join room button
         join_room_btn = QPushButton("Join Another Room")
         join_room_btn.clicked.connect(self.join_room_dialog)
         left_layout.addWidget(join_room_btn)
-        
+
         # Members list
         members_label = QLabel("In Room")
         members_label.setObjectName("SectionLabel")
@@ -1162,24 +1133,24 @@ class ChatWindow(QMainWindow):
 
         self.sidebar_widget.setLayout(left_layout)
         self.sidebar_widget.setMinimumWidth(0)
-        
+
         # Right side - Chat
         chat_widget = QWidget()
         chat_widget.setMinimumWidth(0)
         right_layout = QVBoxLayout()
         right_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Room name
         self.room_name_label = QLabel("Select a room")
         self.room_name_label.setObjectName("RoomTitleLabel")
         self.room_name_label.setMinimumHeight(0)
-        
+
         # Messages + composer in a vertical splitter so the chat pane is draggable.
         self.chat_splitter = QSplitter(Qt.Orientation.Vertical)
-        # Allow dragging message area to full height by collapsing composer pane.
         self.chat_splitter.setChildrenCollapsible(True)
         self.chat_splitter.setHandleWidth(8)
         self.chat_splitter.setOpaqueResize(True)
+        self.chat_splitter.insertWidget(0, self.load_more_btn)
 
         self.message_display = ChatBrowser()
         self.message_display.setObjectName("ChatDisplay")
@@ -1187,7 +1158,68 @@ class ChatWindow(QMainWindow):
         self.message_display.setReadOnly(True)
         self.message_display.setOpenExternalLinks(False)
         self.message_display.anchorClicked.connect(self.open_message_link)
+        self.message_display.verticalScrollBar().valueChanged.connect(lambda _: self._on_chat_scrolled())
         self.chat_splitter.addWidget(self.message_display)
+
+        self.chat_area_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.chat_area_splitter.setChildrenCollapsible(True)
+        self.chat_area_splitter.setHandleWidth(8)
+        self.chat_area_splitter.setOpaqueResize(True)
+        self.chat_area_splitter.addWidget(self.room_name_label)
+        self.chat_area_splitter.addWidget(self.chat_splitter)
+        self.chat_area_splitter.setCollapsible(0, True)
+        self.chat_area_splitter.setCollapsible(1, True)
+        self.chat_area_splitter.setStretchFactor(0, 0)
+        self.chat_area_splitter.setStretchFactor(1, 1)
+        self.chat_area_splitter.setSizes([34, 606])
+        right_layout.addWidget(self.chat_area_splitter)
+        chat_widget.setLayout(right_layout)
+
+        self.main_splitter.addWidget(self.sidebar_widget)
+        self.main_splitter.addWidget(chat_widget)
+        self.main_splitter.setCollapsible(0, True)
+        self.main_splitter.setCollapsible(1, True)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([280, 720])
+
+        # Global vertical splitter enables dragging from top edge too (collapse header).
+        self.window_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.window_splitter.setChildrenCollapsible(True)
+        self.window_splitter.setHandleWidth(8)
+        self.window_splitter.setOpaqueResize(True)
+        self.window_splitter.addWidget(self.header_widget)
+        self.window_splitter.addWidget(self.main_splitter)
+        self.window_splitter.setCollapsible(0, True)
+        self.window_splitter.setCollapsible(1, True)
+        self.window_splitter.setStretchFactor(0, 0)
+        self.window_splitter.setStretchFactor(1, 1)
+        self.window_splitter.setSizes([28, 572])
+
+        main_layout.addWidget(self.window_splitter)
+        central_widget.setLayout(main_layout)
+        self._theme = copy.deepcopy(_THEME_DEFAULTS)
+        self._load_user_settings()
+        self.setWindowTitle("Encrypted Chat")
+        self.setGeometry(100, 100, 1000, 600)
+        self.apply_dark_theme()
+
+
+    def load_more_messages(self):
+        """Fetch the next batch of older messages and prepend them to the chat."""
+        if not self.current_room:
+            return
+        # Determine how many messages are already loaded
+        current_count = len(self._chat_raw_messages)
+        batch_size = 100
+        offset = current_count
+        ok, msgs = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
+        if not ok or not msgs:
+            self.append_system_message("No more messages to load.")
+            return
+        # Prepend new messages (older) to the start
+        self._chat_raw_messages = msgs + self._chat_raw_messages
+        self._schedule_chat_rebuild()
 
         composer_widget = QWidget()
         composer_widget.setMinimumHeight(0)
@@ -1197,6 +1229,7 @@ class ChatWindow(QMainWindow):
         self.message_input = QLineEdit()
         self.message_input.setObjectName("ChatInput")
         self.message_input.returnPressed.connect(self.send_message)
+        composer_layout.addWidget(self.typing_indicator_label)
         composer_layout.addWidget(self.message_input)
 
         button_layout = QHBoxLayout()
@@ -1239,8 +1272,13 @@ class ChatWindow(QMainWindow):
         self.chat_area_splitter.setStretchFactor(1, 1)
         self.chat_area_splitter.setSizes([34, 606])
 
+        # --- Fix: Ensure variables are defined before use ---
+        right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.addWidget(self.chat_area_splitter)
 
+        chat_widget = QWidget()
+        chat_widget.setMinimumWidth(0)
         chat_widget.setLayout(right_layout)
 
         self.main_splitter.addWidget(self.sidebar_widget)
@@ -1256,7 +1294,7 @@ class ChatWindow(QMainWindow):
         self.window_splitter.setChildrenCollapsible(True)
         self.window_splitter.setHandleWidth(8)
         self.window_splitter.setOpaqueResize(True)
-        self.window_splitter.addWidget(header_widget)
+        self.window_splitter.addWidget(self.header_widget)
         self.window_splitter.addWidget(self.main_splitter)
         self.window_splitter.setCollapsible(0, True)
         self.window_splitter.setCollapsible(1, True)
@@ -1264,8 +1302,11 @@ class ChatWindow(QMainWindow):
         self.window_splitter.setStretchFactor(1, 1)
         self.window_splitter.setSizes([28, 572])
 
+        main_layout = QVBoxLayout()
         main_layout.addWidget(self.window_splitter)
+        central_widget = QWidget()
         central_widget.setLayout(main_layout)
+        self.setCentralWidget(central_widget)
         
         # Prevent WorkerThread instances from being garbage-collected mid-run
         self._workers = []
@@ -1280,6 +1321,11 @@ class ChatWindow(QMainWindow):
         self.members_refresh_timer.setInterval(3000)
         self.members_refresh_timer.timeout.connect(self.refresh_members)
         self.members_refresh_timer.start()
+
+        # Ensure window and layout are visible
+        self.show()
+        self.raise_()
+        self.update()
     
     def show_login(self) -> bool:
         """Show login dialog. Returns True only on successful login."""
@@ -1302,6 +1348,11 @@ class ChatWindow(QMainWindow):
             self.update_check_timer.setInterval(15 * 60 * 1000)
             self.update_check_timer.timeout.connect(lambda: self.check_for_updates(manual=False))
             self.update_check_timer.start()
+
+            # Ensure window and layout are visible after login
+            self.show()
+            self.raise_()
+            self.update()
             return True
         return False
 
@@ -1663,6 +1714,9 @@ class ChatWindow(QMainWindow):
             splitter = getattr(self, attr, None)
             if splitter is not None:
                 splitter.setHandleWidth(handle_width)
+        # Update typing indicator style to match new theme
+        if hasattr(self, 'typing_indicator_label'):
+            self._update_typing_indicator_style()
 
     def apply_dark_theme(self):
         """Apply initial theme (uses persisted or default settings)."""
@@ -1851,8 +1905,10 @@ class ChatWindow(QMainWindow):
             return f"[Image] {file_url}"
         return content
 
-    def _save_images_from_chat(self, folder_path: Optional[str] = None) -> tuple:
-        """Save all image URLs from currently loaded chat messages to a local folder."""
+    def _save_images_from_chat(self, folder_path: Optional[str] = None, save_all: bool = False) -> tuple:
+        """Save image URLs from chat messages to a local folder. If save_all is True, fetch all messages in batches."""
+        import requests
+        from urllib.parse import urlparse
         if not folder_path:
             folder_path = QFileDialog.getExistingDirectory(self, "Select folder to save images")
             if not folder_path:
@@ -1861,8 +1917,24 @@ class ChatWindow(QMainWindow):
         target_dir = Path(folder_path)
         target_dir.mkdir(parents=True, exist_ok=True)
 
+        messages = []
+        if save_all and self.current_room:
+            # Fetch all messages in batches
+            offset = 0
+            batch_size = 100
+            while True:
+                ok, batch = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
+                if not ok or not batch:
+                    break
+                messages.extend(batch)
+                if len(batch) < batch_size:
+                    break
+                offset += batch_size
+        else:
+            messages = self._chat_raw_messages
+
         image_urls = []
-        for msg in self._chat_raw_messages:
+        for msg in messages:
             if not isinstance(msg, dict):
                 continue
             if msg.get("msg_type") == "system":
@@ -1873,7 +1945,7 @@ class ChatWindow(QMainWindow):
         # Preserve order while removing duplicates.
         unique_urls = list(dict.fromkeys(image_urls))
         if not unique_urls:
-            return False, "No image URLs found in current chat view"
+            return False, "No image URLs found in chat messages"
 
         saved_count = 0
         failed_count = 0
@@ -2256,11 +2328,17 @@ class ChatWindow(QMainWindow):
 
         def _fetch(rid):
             print("IN on_room_selected _fetch, rid:", rid)
-            ok_join, _ = self.api_client.join_room(rid)
+            ok_join, join_response = self.api_client.join_room(rid)
             if not ok_join:
                 print("join_room failed")
                 return None
-            ok_msgs, messages = self.api_client.get_messages(rid, limit=500)
+            # Set encryption key if present in join_response
+            if isinstance(join_response, dict) and "key" in join_response:
+                try:
+                    client_encryption_manager.set_room_key(rid, join_response["key"])
+                except Exception as e:
+                    print(f"Failed to set encryption key for room {rid}: {e}")
+            ok_msgs, messages = self.api_client.get_messages(rid, limit=100)
             ok_mbrs, members = self.api_client.get_room_members(rid)
             print("Fetched messages:", messages)
             print("Fetched members:", members)
@@ -2299,7 +2377,7 @@ class ChatWindow(QMainWindow):
         if not self.current_room:
             return
         def _fetch(rid):
-            ok, msgs = self.api_client.get_messages(rid, limit=500)
+            ok, msgs = self.api_client.get_messages(rid, limit=100)
             return msgs if ok else []
         def _apply(messages):
             print("Loaded messages:", messages)  # DEBUG: Print loaded messages
@@ -2347,6 +2425,12 @@ class ChatWindow(QMainWindow):
         content = self.message_input.text().strip()
         if not content:
             return
+        # Encrypt message content for E2EE
+        try:
+            encrypted_content = client_encryption_manager.encrypt(self.current_room, content)
+        except Exception as e:
+            self.append_system_message(f"Encryption error: {e}")
+            return
 
         first_token = content.split(maxsplit=1)[0].lower()
 
@@ -2384,9 +2468,18 @@ class ChatWindow(QMainWindow):
             return
 
         if first_token == "!saveimages":
-            parts = content.split(maxsplit=1)
-            folder_arg = parts[1].strip() if len(parts) > 1 else None
-            success, result = self._save_images_from_chat(folder_arg)
+            # Syntax: !saveimages [all] [folder]
+            parts = content.split()
+            save_all = False
+            folder_arg = None
+            if len(parts) > 1:
+                if parts[1].lower() == "all":
+                    save_all = True
+                    if len(parts) > 2:
+                        folder_arg = parts[2].strip()
+                else:
+                    folder_arg = parts[1].strip()
+            success, result = self._save_images_from_chat(folder_arg, save_all=save_all)
             if not success:
                 self.append_system_message(f"Save images: {result}")
             else:
@@ -3284,7 +3377,12 @@ class ChatWindow(QMainWindow):
 
         username = data.get("username", "Unknown")
         msg_type = data.get("message_type", "text")
-        content = self._display_content_from_message(data)
+        # Decrypt message content for E2EE
+        try:
+            decrypted_content = client_encryption_manager.decrypt(self.current_room, data.get("content", ""))
+        except Exception as e:
+            decrypted_content = f"[Decryption error: {e}]"
+        content = self._display_content_from_message({**data, "content": decrypted_content})
         attachment = self._extract_attachment_from_message(data)
 
         self.append_chat_message(username, content, msg_type, attachment)
@@ -3312,7 +3410,34 @@ class ChatWindow(QMainWindow):
     
     def on_typing(self, data: dict):
         """Handle typing indicator."""
-        pass  # Could show "User is typing..."
+        username = data.get("username")
+        if not username or username == self.api_client.username:
+            return
+        # Add user to typing set and update indicator
+        self.typing_users.add(username)
+        self._update_typing_indicator()
+        # Remove after 3 seconds if no further typing event
+        def clear_typing():
+            self.typing_users.discard(username)
+            self._update_typing_indicator()
+        QTimer.singleShot(3000, clear_typing)
+        # Throttle typing events
+        self._last_typing_sent = 0
+        self.message_input.textEdited.connect(self._on_user_typing)
+
+    def _on_user_typing(self):
+        now = time.time()
+        if now - getattr(self, '_last_typing_sent', 0) > 2:
+            if self.websocket_thread and hasattr(self.websocket_thread, 'client') and self.websocket_thread.client:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.ensure_future(self.websocket_thread.client.send_typing())
+                    else:
+                        loop.run_until_complete(self.websocket_thread.client.send_typing())
+                except Exception:
+                    pass
+            self._last_typing_sent = now
 
     def on_message_deleted(self, data: dict):
         """Handle message deletion broadcast by reloading room history."""
@@ -4056,8 +4181,12 @@ class ChatWindow(QMainWindow):
         if self.websocket_thread:
             self.websocket_thread.stop()
             self.websocket_thread.wait(1500)
-        self.room_refresh_thread.stop()
-        self.room_refresh_thread.wait(1500)
+        if hasattr(self, 'room_refresh_thread') and self.room_refresh_thread:
+            try:
+                self.room_refresh_thread.stop()
+                self.room_refresh_thread.wait(1500)
+            except Exception as e:
+                print(f"Error stopping room_refresh_thread: {e}")
         super().closeEvent(event)
 
 
@@ -4066,8 +4195,8 @@ class ChatApp(QApplication):
     
     def __init__(self, argv, server_url: str = "http://localhost:8000"):
         super().__init__(argv)
-        
-        self.window = ChatWindow(server_url)
+        api_client = APIClient(server_url)
+        self.window = ChatWindow(server_url=server_url, api_client=api_client)
         if not self.window.show_login():
             sys.exit(0)
         self.window.show()
