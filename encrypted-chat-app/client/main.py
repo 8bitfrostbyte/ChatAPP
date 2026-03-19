@@ -1046,8 +1046,12 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
+        _busy = False
     # Persistent image cache for the session (URL -> chatimg://key)
     _global_image_cache = {}
+    """Main chat window."""
+    
+    _busy = False
     """Main chat window."""
     
     def __init__(self, server_url: str):
@@ -2204,10 +2208,7 @@ class ChatWindow(QMainWindow):
                 "is_private": is_private,
                 "created_by": created_by,
                 "name": room["name"],
-            }
-        if selected_item is not None:
-            self.room_list.setCurrentItem(selected_item)
-    
+           
     def on_room_selected(self, item):
         """Handle room selection — all network calls run in background."""
         room_id = item.data(Qt.ItemDataRole.UserRole)
