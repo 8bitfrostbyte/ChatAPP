@@ -1,3 +1,71 @@
+# --- WebSocket Chat Handler ---
+from fastapi import WebSocket, WebSocketDisconnect
+import json
+
+# In-memory room connection registry
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[int, List[WebSocket]] = {}
+
+    async def connect(self, room_id: int, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.setdefault(room_id, []).append(websocket)
+
+    def disconnect(self, room_id: int, websocket: WebSocket):
+        if room_id in self.active_connections:
+            self.active_connections[room_id].remove(websocket)
+            if not self.active_connections[room_id]:
+                del self.active_connections[room_id]
+
+    async def broadcast(self, room_id: int, message: dict):
+        for ws in self.active_connections.get(room_id, []):
+            try:
+                await ws.send_text(json.dumps(message))
+            except Exception:
+                pass
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/rooms/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = Depends(get_db)):
+    await manager.connect(room_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+            except Exception:
+                continue
+            if msg.get("type") == "message":
+                # Save message to DB
+                token = websocket.headers.get("authorization")
+                user = None
+                if token and token.startswith("Bearer "):
+                    token = token.split(" ")[1]
+                    user, _ = auth_manager.verify_token(db, token)
+                if not user:
+                    continue
+                message = Message(
+                    room_id=room_id,
+                    user_id=user.id,
+                    content=msg.get("content", ""),
+                    message_type="text",
+                )
+                db.add(message)
+                db.commit()
+                db.refresh(message)
+                payload = {
+                    "id": message.id,
+                    "user_id": message.user_id,
+                    "username": user.username,
+                    "content": message.content,
+                    "message_type": message.message_type,
+                    "created_at": message.created_at.isoformat(),
+                }
+                await manager.broadcast(room_id, payload)
+            # Add more message types (e.g., file/image) as needed
+    except WebSocketDisconnect:
+        manager.disconnect(room_id, websocket)
 
 
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, File, UploadFile, Query, Header, Request
