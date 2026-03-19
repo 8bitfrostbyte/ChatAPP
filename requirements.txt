@@ -1,0 +1,6 @@
+PyQt6
+fastapi
+cryptography
+playsound
+requests
+websockets
