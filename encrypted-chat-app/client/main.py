@@ -458,7 +458,7 @@ class APIClient:
         except Exception as e:
             return False, []
     
-    def get_messages(self, room_id: int, limit: int = 100, offset: int = 0) -> tuple:
+    def get_messages(self, room_id: int, limit: int = 30, offset: int = 0) -> tuple:
         """Get message history."""
         try:
             response = requests.get(
@@ -1049,6 +1049,14 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
+    def auto_join_default_room(self):
+        """Automatically join room 1 after login."""
+        try:
+            ok, _ = self.api_client.join_room(1)
+            if ok:
+                print("Auto-joined room 1 after login.")
+        except Exception as e:
+            print(f"Failed to auto-join room 1: {e}")
 
     def show_login(self) -> bool:
         """Show login dialog. Returns True only on successful login."""
@@ -1057,7 +1065,7 @@ class ChatWindow(QMainWindow):
             self.user_label.setText(f"User: {self.api_client.username}")
             self.setWindowTitle(f"Encrypted Chat - {self.api_client.username}")
             self.refresh_rooms()
-            self.auto_join_default_room()
+            self.auto_join_default_room()  # Auto-join room 1 for all users
             self.check_pending_private_invites()
 
             self.invites_check_timer = QTimer(self)
@@ -1105,6 +1113,7 @@ class ChatWindow(QMainWindow):
 
     def __init__(self, *args, server_url=None, api_client=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.notification_handler = NotificationHandler(self)
         # Typing indicator label (must be initialized after QApplication)
         self.typing_indicator_label = QLabel("")
         self.typing_indicator_label.setObjectName("TypingIndicatorLabel")
@@ -1229,6 +1238,7 @@ class ChatWindow(QMainWindow):
         composer_widget.setMinimumHeight(0)
         composer_layout = QVBoxLayout()
         composer_layout.setContentsMargins(0, 0, 0, 0)
+        composer_layout.setSpacing(0)  # Remove vertical gap between typing window and chat window
 
         self.message_input = QLineEdit()
         self.message_input.setObjectName("ChatInput")
@@ -1260,7 +1270,7 @@ class ChatWindow(QMainWindow):
         self.chat_splitter.setCollapsible(1, True)
         self.chat_splitter.setStretchFactor(0, 1)
         self.chat_splitter.setStretchFactor(1, 0)
-        self.chat_splitter.setSizes([520, 120])
+        self.chat_splitter.setSizes([520, 80])  # Reduce composer height for no gap
 
         self.chat_area_splitter = QSplitter(Qt.Orientation.Vertical)
         self.chat_area_splitter.setChildrenCollapsible(True)
@@ -1874,7 +1884,7 @@ class ChatWindow(QMainWindow):
         if save_all and self.current_room:
             # Fetch all messages in batches
             offset = 0
-            batch_size = 100
+            batch_size = getattr(self, "message_limit", 30)
             while True:
                 ok, batch = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
                 if not ok or not batch:
@@ -2291,7 +2301,7 @@ class ChatWindow(QMainWindow):
                     client_encryption_manager.set_room_key(rid, join_response["key"])
                 except Exception as e:
                     print(f"Failed to set encryption key for room {rid}: {e}")
-            ok_msgs, messages = self.api_client.get_messages(rid, limit=100)
+            ok_msgs, messages = self.api_client.get_messages(rid, limit=30)
             ok_mbrs, members = self.api_client.get_room_members(rid)
             print("Fetched messages:", messages)
             print("Fetched members:", members)
@@ -2330,7 +2340,7 @@ class ChatWindow(QMainWindow):
         if not self.current_room:
             return
         def _fetch(rid):
-            ok, msgs = self.api_client.get_messages(rid, limit=100)
+            ok, msgs = self.api_client.get_messages(rid, limit=30)
             return msgs if ok else []
         def _apply(messages):
             print("Loaded messages:", messages)  # DEBUG: Print loaded messages
@@ -3459,9 +3469,29 @@ class ChatWindow(QMainWindow):
         test_sound_btn = QPushButton("Test Notification Sound")
         test_sound_btn.clicked.connect(self.notification_handler.play_sound)
         notif_layout.addWidget(test_sound_btn)
+
+        # Message Load Limit Setting
+        notif_layout.addWidget(QLabel("Message Load Limit:"))
+        self.message_limit_spin = QSpinBox()
+        self.message_limit_spin.setRange(5, 500)
+        self.message_limit_spin.setValue(getattr(self, "message_limit", 30))
+        notif_layout.addWidget(self.message_limit_spin)
         notif_layout.addStretch()
         notif_widget.setLayout(notif_layout)
         tabs.addTab(notif_widget, "Notifications")
+
+        # Accept/Cancel buttons with save logic
+        outer.addWidget(tabs)
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        def on_accept():
+            self.message_limit = self.message_limit_spin.value()
+            self._save_user_settings()
+            dialog.accept()
+        btn_box.accepted.connect(on_accept)
+        btn_box.rejected.connect(dialog.reject)
+        outer.addWidget(btn_box)
+        dialog.setLayout(outer)
+        dialog.exec()
 
         # ── Tab 2: Updates ──────────────────────────────────────────────────
         updates_widget = QWidget()
