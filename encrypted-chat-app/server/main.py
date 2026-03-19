@@ -255,8 +255,6 @@ def _ensure_cached_release_exe(release_info: dict) -> Path:
     return target_path
 
 
-def ensure_room_encryption_key(db: Session, room: Room) -> bytes:
-
 
 class BotStreamManager:
     """Manages interval-based bot image streams per room."""
