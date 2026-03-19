@@ -1046,16 +1046,16 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
-        def set_busy(self, busy: bool, message: str = None):
-            """Set the busy state and optionally display a status message."""
-            ChatWindow._busy = busy
-            # Optionally, update the UI to reflect busy state
-            if hasattr(self, 'statusBar') and callable(getattr(self, 'statusBar', None)):
-                bar = self.statusBar()
-                if busy:
-                    bar.showMessage(message or "Working...", 5000)
-                else:
-                    bar.clearMessage()
+    def set_busy(self, busy: bool, message: str = None):
+        """Set the busy state and optionally display a status message."""
+        ChatWindow._busy = busy
+        # Optionally, update the UI to reflect busy state
+        if hasattr(self, 'statusBar') and callable(getattr(self, 'statusBar', None)):
+            bar = self.statusBar()
+            if busy:
+                bar.showMessage(message or "Working...", 5000)
+            else:
+                bar.clearMessage()
     _busy = False
     # Persistent image cache for the session (URL -> chatimg://key)
     _global_image_cache = {}
