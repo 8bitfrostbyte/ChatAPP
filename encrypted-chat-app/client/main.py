@@ -2041,13 +2041,13 @@ class ChatWindow(QMainWindow):
             )
 
         is_self = username == self.api_client.username
-        align = "right" if is_self else "left"
+        align = "left"
         name_color = t["msg_own_name"] if is_self else t["msg_other_name"]
         text_color = t["msg_own_text"] if is_self else t["msg_other_text"]
         timestamp_color = t.get("timestamp_color", t["system_color"])
 
         return (
-            f'<div style="text-align:{align};margin:{spacing}px 0;">'
+            f'<div style="text-align:left;margin:{spacing}px 0;">'
             f'<span style="color:{timestamp_color};font-size:{ts}px;">[{timestamp}] </span>'
             f'<span style="color:{name_color};font-weight:{uw};">{username}</span><br>'
             f'<span style="color:{text_color};{font_style}">{body_html}</span>'
@@ -2362,7 +2362,11 @@ class ChatWindow(QMainWindow):
                 self.append_system_message("Usage: !clear <count> (count must be > 0)")
                 self.message_input.clear()
                 return
-
+            if count > 500:
+                self.append_system_message("You can only clear up to 500 messages at a time.")
+                self.message_input.clear()
+                return
+            print(f"[DEBUG] Sending clear request for {count} messages")
             success, result = self.api_client.clear_room_messages(self.current_room, count)
             if not success:
                 self.append_system_message(f"Clear failed: {result}")

@@ -1233,6 +1233,8 @@ async def clear_room_messages(
 
     target_messages = query.order_by(Message.created_at.desc()).limit(count).all()
 
+    print(f"[DEBUG] clear_room_messages: count={count}, found={len(target_messages)} messages to delete: {[m.id for m in target_messages]}")
+
     if not target_messages:
         return {"deleted": 0, "message": "No matching messages to clear"}
 
@@ -1242,6 +1244,8 @@ async def clear_room_messages(
         _hard_delete_message(db, msg)
 
     db.commit()
+
+    print(f"[DEBUG] clear_room_messages: actually deleted {len(deleted_ids)} messages: {deleted_ids}")
 
     for msg_id in deleted_ids:
         await manager.broadcast(room_id, {
