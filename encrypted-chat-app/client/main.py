@@ -1588,6 +1588,7 @@ class ChatWindow(QMainWindow):
                 border: {bw}px solid {t['border_color']};
                 border-radius: {wr}px;
                 padding: 6px;
+                margin: 0;
                 color: {t['text_color']};
                 selection-background-color: {t['button_bg']};
                 {font_text}
@@ -1601,6 +1602,21 @@ class ChatWindow(QMainWindow):
             QTabWidget::pane {{
                 background-color: {t['panel_bg']};
                 border: {bw}px solid {t['border_color']};
+            }}
+            QTabBar::tab {{
+                background: {t['button_bg']};
+                color: {t['button_text']};
+                padding: 6px 12px;
+                border-radius: {br}px;
+                margin: 2px;
+            }}
+            QTabBar::tab:selected {{
+                background: {t['button_border']};
+                color: {t['button_text']};
+            }}
+            QTabBar::tab:hover {{
+                background: {t['button_bg']};
+                color: {t['button_text']};
             }}
             QPushButton {{
                 background-color: {t['button_bg']};
