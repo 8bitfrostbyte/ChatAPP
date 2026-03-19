@@ -2309,7 +2309,9 @@ class ChatWindow(QMainWindow):
             # Reset deduplication state so deleted presence messages do not reappear
             self._last_presence_message = None
             self._last_presence_at = 0
+            print(f"[DEBUG] load_messages: received {len(messages)} messages")
             deduped_messages = self._dedupe_presence_history(messages)
+            print(f"[DEBUG] load_messages: deduped to {len(deduped_messages)} messages")
             html_lines = []
             for msg in deduped_messages:
                 self._seen_live_message_keys.add(self._message_event_key(msg))
@@ -2328,6 +2330,7 @@ class ChatWindow(QMainWindow):
                 body_html = self._build_message_body_html(content, sources)
                 html_line = self.format_message_html(username, body_html, msg_type)
                 html_lines.append(html_line)
+            print(f"[DEBUG] load_messages: generated {len(html_lines)} html lines")
             # Set all messages at once for performance
             self.message_display.setHtml("\n".join(html_lines))
             self._schedule_chat_rebuild()  # Ensure UI is rebuilt after loading messages
