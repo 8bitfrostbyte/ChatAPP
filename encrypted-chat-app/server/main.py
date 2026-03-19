@@ -256,18 +256,6 @@ def _ensure_cached_release_exe(release_info: dict) -> Path:
 
 
 def ensure_room_encryption_key(db: Session, room: Room) -> bytes:
-    """Ensure room has a persistent encryption key in DB and loaded in memory."""
-    if room.encryption_key:
-        key_bytes = bytes(room.encryption_key)
-        encryption_manager.set_room_key(room.id, key_bytes)
-        return key_bytes
-
-    key_text = encryption_manager.generate_room_key(room.id)
-    key_bytes = key_text.encode()
-    room.encryption_key = key_bytes
-    db.commit()
-    db.refresh(room)
-    return key_bytes
 
 
 class BotStreamManager:
@@ -300,7 +288,12 @@ class BotStreamManager:
         try:
             bot_user_id = self._get_or_create_bot_user_id()
             # Encrypt content for consistency with user messages
-            encrypted_content = encryption_manager.encrypt_message(room_id, content)
+            message = Message(
+                room_id=room_id,
+                user_id=bot_user_id,
+                content=content,
+                message_type="bot"
+            )
             message = Message(
                 room_id=room_id,
                 user_id=bot_user_id,
@@ -335,7 +328,7 @@ class BotStreamManager:
             miss_count = 0
             error_streak = 0
             while True:
-                image_post = await asyncio.to_thread(image_bot.fetch_buffered_image, tag_pool)
+                image_post = await asyncio.to_thread(image_bot.fetch_images, fallback_tag, 1)
                 if not image_post or not image_post.get("url"):
                     fallback_tag = random.choice(tag_pool) if tag_pool else "rating:explicit"
                     fallback_images = await asyncio.to_thread(image_bot.fetch_images, fallback_tag, 1)
