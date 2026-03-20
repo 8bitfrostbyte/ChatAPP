@@ -1049,6 +1049,35 @@ class ChatBrowser(QTextBrowser):
 
 
 class ChatWindow(QMainWindow):
+    def _on_chat_scrolled(self):
+        """Load older messages when user scrolls to the top of the chat display."""
+        scrollbar = self.message_display.verticalScrollBar()
+        if scrollbar.value() == scrollbar.minimum():
+            # User scrolled to the top, load older messages
+            self._load_older_messages()
+
+    def _load_older_messages(self):
+        """Fetch and prepend older messages to the chat display."""
+        if not self.current_room:
+            return
+        # Track how many messages are currently loaded
+        loaded_count = len(self._chat_raw_messages)
+        batch_size = getattr(self, "message_limit", 30)
+        # Fetch the next batch of older messages
+        offset = loaded_count
+        ok, older_messages = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
+        if not ok or not older_messages:
+            return  # No more messages to load
+        # Prepend older messages to the raw message list
+        self._chat_raw_messages = list(older_messages) + self._chat_raw_messages
+        # Rebuild the chat display, preserving scroll position
+        prev_scroll_value = self.message_display.verticalScrollBar().value()
+        prev_max = self.message_display.verticalScrollBar().maximum()
+        self._rebuild_chat_display()
+        # After rebuilding, restore scroll position to where user was
+        new_max = self.message_display.verticalScrollBar().maximum()
+        self.message_display.verticalScrollBar().setValue(new_max - prev_max + prev_scroll_value)
+
     def auto_join_default_room(self):
         """Automatically join room 1 after login (no encryption)."""
         try:
@@ -2494,27 +2523,13 @@ class ChatWindow(QMainWindow):
         self.append_chat_message("SYSTEM", text, "system")
 
     def show_room_commands(self):
-        """Display all room commands."""
+        """Display all implemented commands as plain text, no HTML tags or entities."""
         commands = [
-            "Room Commands:",
-            "!rooms - List all available rooms",
-            "!createroom <name> [private] - Create a new room",
-            "!removeroom <name|id> - Delete a room (creator-only)",
-            "!makeprivate - Make current room private (creator-only)",
-            "!invite <username> <room_name|id> - Invite user to room (creator-only)",
-            "!leaveroom [room_name|id] - Leave a room (current room if omitted)",
-            "Invite flow: invited users accept/decline through in-app popup",
-            "!clear <count> - Clear recent non-system messages in this room",
-            "!saveimages [folder_path] - Save all image URLs currently visible in chat to a folder",
-            "!download <filename> <folder_path> - Download an uploaded file from current chat",
-            "!room clear <count> - Alias for clearing recent room messages",
-            "!botcommands - Show bot command list",
-            "/room list - List available rooms",
-            "/room create <name> [private] - Create a new room",
-            "/room delete <name|id> - Delete a room",
-            "/room makeprivate - Make current room private"
+            "Room Commands: !rooms - List all available rooms, !createroom <name> [private] - Create a new room, !removeroom <name|id> - Delete a room (creator-only), !makeprivate - Make current room private (creator-only), !invite <username> <room_name|id> - Invite user to room (creator-only), !leaveroom [room_name|id] - Leave a room (current room if omitted), !clear <count> - Clear recent non-system messages in this room, !saveimages [all] [folder_path] - Save image URLs from chat (all = fetch all history), !download <filename> <folder_path> - Download an uploaded file from chat, !room clear <count> - Alias for clearing recent room messages, !botcommands - Show bot command list.",
+            "Bot Commands: !start <seconds> [tags] - Start image streaming, !pause - Pause the stream, !resume - Resume the stream, !stop - Stop the stream, !status - Show stream status, !addtags <tag1,tag2> - Add tags to saved pool, !removetags <tag1,tag2|count> - Remove named tags or first N tags from taglist, !taglist - Show saved tags, !cleartags - Clear all saved tags, !botcommands - Show this bot command list, !bot search <tags> - Search for images, !searchtags <query> - Detailed tag search (botUpdated-style), !bot image <tags> - Fetch single image, !bot blacklist show|add|remove|clear - Manage blacklist.",
+            "Miscellaneous: !help - Show help for commands, !commands - Show this command list."
         ]
-        self.append_system_message(" | ".join(commands))
+        self.append_system_message("\n\n".join(commands))
 
     def show_bot_commands(self):
         """Display all bot commands."""
