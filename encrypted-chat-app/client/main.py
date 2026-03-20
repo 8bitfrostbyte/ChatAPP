@@ -47,7 +47,8 @@ def _load_client_version(default: str = "1.0.0") -> str:
         else:
             base_dir = Path(__file__).resolve().parent
         version_path = base_dir / "version.txt"
-        if version_path").strip()
+        if version_path.exists():
+            value = version_path.read_text(encoding="utf-8").strip()
             if value:
                 return value
     except Exception:
