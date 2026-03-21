@@ -396,15 +396,16 @@ class BotStreamManager:
             )
             miss_count = 0
             error_streak = 0
-            # Initialize fallback_tag before loop
             import random
-            fallback_tag = random.choice(tag_pool) if tag_pool else "rating:explicit"
             while True:
-                images = await asyncio.to_thread(image_bot.fetch_images, fallback_tag, 1)
+                # Pick a random tag for every image
+                current_tag = random.choice(tag_pool) if tag_pool else "rating:explicit"
+                images = await asyncio.to_thread(image_bot.fetch_images, current_tag, 1)
                 image_post = images[0] if images else None
                 if not image_post or not image_post.get("url"):
-                    fallback_tag = random.choice(tag_pool) if tag_pool else "rating:explicit"
-                    fallback_images = await asyncio.to_thread(image_bot.fetch_images, fallback_tag, 1)
+                    # Try another random tag if miss
+                    current_tag = random.choice(tag_pool) if tag_pool else "rating:explicit"
+                    fallback_images = await asyncio.to_thread(image_bot.fetch_images, current_tag, 1)
                     image_post = fallback_images[0] if fallback_images else None
 
                 if image_post and image_post.get("url"):
