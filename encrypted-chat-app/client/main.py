@@ -1038,12 +1038,34 @@ class ChatBrowser(QTextBrowser):
 
     def loadResource(self, resource_type, url):
         if resource_type == 2:  # QTextDocument.ResourceType.ImageResource
-            data = ChatBrowser._image_store.get(url.toString())
+            key = url.toString()
+            data = ChatBrowser._image_store.get(key)
             if data is not None:
                 from PyQt6.QtGui import QImage
                 img = QImage()
                 img.loadFromData(data)
                 return img
+            # Lazy load: try to fetch and cache the image if not present
+            # Find the parent window to access _cache_image_url
+            parent = self.parent()
+            while parent and not hasattr(parent, '_cache_image_url'):
+                parent = parent.parent() if hasattr(parent, 'parent') else None
+            if parent and hasattr(parent, '_cache_image_url'):
+                # Try to find the original URL from the key
+                import re
+                # The key is 'chatimg://<md5>', so we need to map it back
+                # We'll try all known URLs in the parent's _image_cache
+                for url_str, cache_key in getattr(parent, '_image_cache', {}).items():
+                    if cache_key == key:
+                        parent._cache_image_url(url_str)
+                        data = ChatBrowser._image_store.get(key)
+                        if data is not None:
+                            from PyQt6.QtGui import QImage
+                            img = QImage()
+                            img.loadFromData(data)
+                            return img
+                        break
+            # Optionally, could trigger a repaint or reload here
         return super().loadResource(resource_type, url)
 
 
@@ -1053,8 +1075,9 @@ class ChatWindow(QMainWindow):
         """Load older messages when user scrolls to the top of the chat display."""
         scrollbar = self.message_display.verticalScrollBar()
         if scrollbar.value() == scrollbar.minimum():
-            # User scrolled to the top, load older messages
-            self._load_older_messages()
+            # User scrolled to the top, load older messages if not busy
+            if not self._busy:
+                self._load_older_messages()
 
     def _load_older_messages(self):
         """Fetch and prepend older messages to the chat display."""
@@ -1113,6 +1136,7 @@ class ChatWindow(QMainWindow):
             self.show()
             self.raise_()
             self.update()
+            self.set_busy(False)  # Reset busy state on successful login
             return True
         return False
 
@@ -1135,6 +1159,7 @@ class ChatWindow(QMainWindow):
     def set_busy(self, busy, message=None):
         # Stub: implement busy indicator if needed
         pass
+        self._busy = busy
 
     _busy = False
     # Persistent image cache for the session (URL -> chatimg://key)
@@ -1163,6 +1188,10 @@ class ChatWindow(QMainWindow):
         self._image_cache = {}
         self._pending_update_info = {}
         self._seen_invite_ids = set()
+        # Batch message load limit
+        self.message_limit = 5
+        # Track settings dialog instance
+        self.settings_dialog = None
         # Main widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1284,9 +1313,9 @@ class ChatWindow(QMainWindow):
         upload_btn.clicked.connect(self.upload_file_dialog)
         button_layout.addWidget(upload_btn)
 
-        settings_btn = QPushButton("Settings")
-        settings_btn.clicked.connect(self.show_settings)
-        button_layout.addWidget(settings_btn)
+        self.settings_btn = QPushButton("Settings")
+        self.settings_btn.clicked.connect(self.show_settings)
+        button_layout.addWidget(self.settings_btn)
 
         logout_btn = QPushButton("Logout")
         logout_btn.clicked.connect(self.logout)
@@ -1338,11 +1367,13 @@ class ChatWindow(QMainWindow):
 
         main_layout.addWidget(self.window_splitter)
         central_widget.setLayout(main_layout)
+        self.settings_path = self._resolve_settings_path()
         self._theme = copy.deepcopy(_THEME_DEFAULTS)
         self._load_user_settings()
         self.setWindowTitle("Encrypted Chat - Main Window")
         self.setGeometry(100, 100, 1000, 600)
-        self.apply_dark_theme()
+        # Apply the loaded theme (from user settings), not always dark
+        self._apply_theme()
 
 
 
@@ -1897,8 +1928,8 @@ class ChatWindow(QMainWindow):
             return f"[Image] {file_url}"
         return content
 
-    def _save_images_from_chat(self, folder_path: Optional[str] = None, save_all: bool = False) -> tuple:
-        """Save image URLs from chat messages to a local folder. If save_all is True, fetch all messages in batches."""
+    def _save_images_from_chat(self, folder_path: Optional[str] = None, save_all: bool = False, bot_only: bool = False) -> tuple:
+        """Save image URLs from chat messages to a local folder. If save_all is True, fetch all messages in batches. If bot_only is True, only save images sent by the bot."""
         import requests
         from urllib.parse import urlparse
         if not folder_path:
@@ -1924,6 +1955,10 @@ class ChatWindow(QMainWindow):
                 offset += batch_size
         else:
             messages = self._chat_raw_messages
+
+        # Filter for bot messages if requested
+        if bot_only:
+            messages = [msg for msg in messages if str(msg.get("username", "")).lower() == "imagebot"]
 
         image_urls = []
         for msg in messages:
@@ -2179,31 +2214,23 @@ class ChatWindow(QMainWindow):
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 20
         self.message_display.clear()
 
-        # Pass 1: Collect all image URLs that are not yet cached
-        uncached_urls = set()
-        for msg in self._chat_raw_messages:
-            t = msg.get("msg_type") or msg.get("message_type", "text")
-            if t == "system":
-                continue
-            c = msg.get("content", "")
-            urls = self._extract_image_urls(c)
-            for url in urls:
-                if url not in self._image_cache:
-                    uncached_urls.add(url)
-
-        # Fetch/cache any missing images synchronously (history only, not for live messages)
-        if uncached_urls:
-            print(f"[DEBUG] Caching {len(uncached_urls)} uncached image URLs for history: {uncached_urls}")
-            for url in uncached_urls:
-                self._cache_image_url(url)
-
-        # Pass 2: Render all messages
+        # Only render messages; do not pre-cache images
         for msg in list(self._chat_raw_messages):
             u = msg.get("username", "Unknown")
             c = msg.get("content", "")
             t = msg.get("msg_type") or msg.get("message_type", "text")
             urls = self._extract_image_urls(c) if t != "system" else []
-            sources = {url: self._image_cache[url] for url in urls if url in self._image_cache}
+            # For lazy loading, always generate the src for all image URLs, even if not cached
+            sources = {}
+            for url in urls:
+                if url in self._image_cache:
+                    sources[url] = self._image_cache[url]
+                else:
+                    # Generate the cache key for this URL
+                    import hashlib
+                    key = "chatimg://" + hashlib.md5(url.encode()).hexdigest()
+                    self._image_cache[url] = key
+                    sources[url] = key
             body_html = self._build_message_body_html(c, sources)
             if urls:
                 print(f"[DEBUG] Image message for {u}: urls={urls}, sources={list(sources.keys())}, body_html={body_html}")
@@ -2358,49 +2385,51 @@ class ChatWindow(QMainWindow):
         print("IN on_room_selected, calling _run_in_bg with room_id:", room_id)
         self._run_in_bg(_fetch, _apply, room_id)
 
-    def load_messages(self):
-        """Reload message history for current room in background."""
+    def _load_older_messages(self):
+        """Fetch and prepend older messages to the chat display."""
         if not self.current_room:
             return
-        def _fetch(rid):
-            ok, msgs = self.api_client.get_messages(rid, limit=30)
-            return msgs if ok else []
-        def _apply(messages):
-            print("Loaded messages:", messages)  # DEBUG: Print loaded messages
-            self.message_display.clear()
-            self._chat_raw_messages.clear()
-            self._seen_live_message_keys.clear()
-            # Reset deduplication state so deleted presence messages do not reappear
-            self._last_presence_message = None
-            self._last_presence_at = 0
-            print(f"[DEBUG] load_messages: received {len(messages)} messages")
-            deduped_messages = self._dedupe_presence_history(messages)
-            print(f"[DEBUG] load_messages: deduped to {len(deduped_messages)} messages")
-            html_lines = []
-            for msg in deduped_messages:
-                self._seen_live_message_keys.add(self._message_event_key(msg))
-                username = msg.get("username", "Unknown")
-                msg_type = msg.get("message_type", "text")
-                content = self._display_content_from_message(msg)
-                attachment = self._extract_attachment_from_message(msg)
-                # Build HTML for each message (same as append_chat_message, but do not append)
-                image_urls = set(self._extract_image_urls(content))
-                if attachment and attachment.get("file_url"):
-                    file_url = attachment["file_url"]
-                    file_type = (attachment.get("file_type") or "").lower()
-                    if file_type.startswith("image/") or any(file_url.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]):
-                        image_urls.add(file_url)
-                sources = {url: self._image_cache[url] for url in image_urls if url in self._image_cache}
-                body_html = self._build_message_body_html(content, sources)
-                html_line = self.format_message_html(username, body_html, msg_type)
-                html_lines.append(html_line)
-            print(f"[DEBUG] load_messages: generated {len(html_lines)} html lines")
-            html_content = "\n".join(html_lines)
-            print(f"[DEBUG] Setting chat display HTML:\n{html_content}")
-            # Set all messages at once for performance
-            self.message_display.setHtml(html_content)
-            # Do NOT call _schedule_chat_rebuild here; it will clear the display
-        self._run_in_bg(_fetch, _apply, self.current_room)
+        # Track how many messages are currently loaded
+        loaded_count = len(self._chat_raw_messages)
+        batch_size = getattr(self, "message_limit", 5)
+        # Fetch the next batch of older messages
+        offset = loaded_count
+        ok, older_messages = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
+        if not ok or not older_messages:
+            return  # No more messages to load
+        # Prepend older messages to the raw message list
+        self._chat_raw_messages = list(older_messages) + self._chat_raw_messages
+        # Rebuild the chat display, preserving scroll position
+        prev_scroll_value = self.message_display.verticalScrollBar().value()
+        prev_max = self.message_display.verticalScrollBar().maximum()
+        self._rebuild_chat_display()
+        # After rebuilding, restore scroll position to where user was
+        new_max = self.message_display.verticalScrollBar().maximum()
+        self.message_display.verticalScrollBar().setValue(new_max - prev_max + prev_scroll_value)
+        # The following block had indentation and variable errors and is commented out for now.
+        # If you want to rebuild the chat display with custom HTML, refactor and re-enable as needed.
+        # Example placeholder for correct logic:
+        # html_lines = []
+        # for msg in self._chat_raw_messages:
+        #     username = msg.get("username", "Unknown")
+        #     msg_type = msg.get("message_type", "text")
+        #     content = self._display_content_from_message(msg)
+        #     attachment = self._extract_attachment_from_message(msg)
+        #     image_urls = set(self._extract_image_urls(content))
+        #     if attachment and attachment.get("file_url"):
+        #         file_url = attachment["file_url"]
+        #         file_type = (attachment.get("file_type") or "").lower()
+        #         if file_type.startswith("image/") or any(file_url.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]):
+        #             image_urls.add(file_url)
+        #     sources = {url: self._image_cache[url] for url in image_urls if url in self._image_cache}
+        #     body_html = self._build_message_body_html(content, sources)
+        #     html_line = self.format_message_html(username, body_html, msg_type)
+        #     html_lines.append(html_line)
+        # print(f"[DEBUG] load_messages: generated {len(html_lines)} html lines")
+        # html_content = "\n".join(html_lines)
+        # print(f"[DEBUG] Setting chat display HTML:\n{html_content}")
+        # self.message_display.setHtml(html_content)
+        # Do NOT call _schedule_chat_rebuild here; it will clear the display
     
     def send_message(self):
         """Send a message."""
@@ -2445,29 +2474,44 @@ class ChatWindow(QMainWindow):
                 return
 
             self.append_system_message(result.get("message", "Messages cleared"))
-            self.load_messages()
+            # Reload messages after clearing
+            ok_msgs, messages = self.api_client.get_messages(self.current_room, limit=self.message_limit)
+            self._chat_raw_messages = list(messages) if ok_msgs else []
+            self._rebuild_chat_display()
             self.message_input.clear()
             return
 
         if first_token == "!saveimages":
-            # Syntax: !saveimages [all] [folder]
+            # Syntax: !saveimages [bot] [all] [folder]
             parts = content.split()
             save_all = False
+            bot_only = False
             folder_arg = None
-            if len(parts) > 1:
-                if parts[1].lower() == "all":
-                    save_all = True
-                    if len(parts) > 2:
-                        folder_arg = parts[2].strip()
-                else:
-                    folder_arg = parts[1].strip()
-            success, result = self._save_images_from_chat(folder_arg, save_all=save_all)
+            idx = 1
+            if len(parts) > idx and parts[idx].lower() == "bot":
+                bot_only = True
+                idx += 1
+            if len(parts) > idx and parts[idx].lower() == "all":
+                save_all = True
+                idx += 1
+            if len(parts) > idx:
+                folder_arg = parts[idx].strip()
+
+            success, result = self._save_images_from_chat(folder_arg, save_all=save_all, bot_only=bot_only)
             if not success:
-                self.append_system_message(f"Save images: {result}")
+                saved = result.get('saved', 0) if isinstance(result, dict) else 0
+                failed = result.get('failed', 0) if isinstance(result, dict) else 0
+                folder = result.get('folder', '') if isinstance(result, dict) else ''
+                self.append_system_message(
+                    f"Saved {saved} image(s)"
+                    f" ({failed} failed)" if failed else ''
+                    f" to {folder}" if folder else ''
+                    + (f". Error: {result}" if not isinstance(result, dict) else '')
+                )
             else:
                 self.append_system_message(
                     f"Saved {result['saved']} image(s)"
-                    f"{f' ({result['failed']} failed)' if result['failed'] else ''}"
+                    f" ({result['failed']} failed)" if result['failed'] else ''
                     f" to {result['folder']}"
                 )
             self.message_input.clear()
@@ -3237,7 +3281,7 @@ class ChatWindow(QMainWindow):
             self.append_system_message(f"Clear failed: {result}")
             return
         self.append_system_message(result.get("message", "Messages cleared"))
-        self.load_messages()
+        self._rebuild_chat_display()
 
     def download_attachment_by_name(self, filename: str, folder_path: str):
         """Download the most recent attachment in chat matching filename."""
@@ -3302,7 +3346,7 @@ class ChatWindow(QMainWindow):
                     self.append_chat_message(username, content, msg_type, attachment)
                     QMessageBox.information(self, "Success", f"File uploaded: {uploaded_name}")
                     if room_id == self.current_room:
-                        self.load_messages()
+                        self._rebuild_chat_display()
                 else:
                     QMessageBox.critical(self, "Error", f"Upload failed: {payload}")
 
@@ -3405,7 +3449,7 @@ class ChatWindow(QMainWindow):
 
     def on_message_deleted(self, data: dict):
         """Handle message deletion broadcast by reloading room history."""
-        self.load_messages()
+        self._rebuild_chat_display()
     
     def _update_members(self, members: list):
         """Update the members list widget (must be called on main thread)."""
@@ -3442,72 +3486,314 @@ class ChatWindow(QMainWindow):
         pass
     
     def show_settings(self):
-        """Show settings dialog with Notifications and Appearance tabs."""
+        """Show organized settings dialog with proper tab separation and no duplicates."""
+        # Prevent multiple dialogs
+        if self.settings_dialog is not None:
+            if self.settings_dialog.isVisible():
+                self.settings_dialog.raise_()
+                self.settings_dialog.activateWindow()
+                return
         dialog = QDialog(self)
+        self.settings_dialog = dialog
+        # Disable the settings button while dialog is open
+        if hasattr(self, 'settings_btn'):
+            self.settings_btn.setEnabled(False)
+        def cleanup_dialog():
+            self.settings_dialog = None
+            if hasattr(self, 'settings_btn'):
+                self.settings_btn.setEnabled(True)
+        dialog.finished.connect(cleanup_dialog)
         dialog.setWindowTitle("Settings")
-        dialog.setMinimumWidth(520)
+        dialog.setMinimumWidth(600)
         outer = QVBoxLayout()
-
         tabs = QTabWidget()
 
-        # ── Tab 1: Notifications ──────────────────────────────────────────────
+        # ── Tab 1: Notifications ──
         notif_widget = QWidget()
         notif_layout = QVBoxLayout()
         notif_layout.addWidget(QLabel("Notifications:"))
-
         sound_checkbox = QPushButton("Toggle Sound")
         sound_checkbox.clicked.connect(self._toggle_notification_sound)
         notif_layout.addWidget(sound_checkbox)
-
         custom_sound_btn = QPushButton("Set Custom Message Sound")
         custom_sound_btn.clicked.connect(self._pick_custom_sound)
         notif_layout.addWidget(custom_sound_btn)
-
         clear_custom_sound_btn = QPushButton("Clear Custom Sound")
         clear_custom_sound_btn.clicked.connect(self._clear_custom_sound)
         notif_layout.addWidget(clear_custom_sound_btn)
-
         test_sound_btn = QPushButton("Test Notification Sound")
         test_sound_btn.clicked.connect(self.notification_handler.play_sound)
         notif_layout.addWidget(test_sound_btn)
-
-        # Message Load Limit Setting
-        notif_layout.addWidget(QLabel("Message Load Limit:"))
-        self.message_limit_spin = QSpinBox()
-        self.message_limit_spin.setRange(5, 500)
-        self.message_limit_spin.setValue(getattr(self, "message_limit", 30))
-        notif_layout.addWidget(self.message_limit_spin)
         notif_layout.addStretch()
         notif_widget.setLayout(notif_layout)
         tabs.addTab(notif_widget, "Notifications")
 
-        # Accept/Cancel buttons with save logic
-        outer.addWidget(tabs)
-        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        def on_accept():
-            self.message_limit = self.message_limit_spin.value()
-            self._save_user_settings()
-            dialog.accept()
-        btn_box.accepted.connect(on_accept)
-        btn_box.rejected.connect(dialog.reject)
-        outer.addWidget(btn_box)
-        dialog.setLayout(outer)
-        dialog.exec()
+        # ── Tab 2: Appearance (Basic) ──
+        appearance_widget = QWidget()
+        appearance_layout = QVBoxLayout()
+        appearance_layout.addWidget(QLabel("Theme:"))
+        theme_combo = QComboBox()
+        theme_names = list(_THEME_PRESETS.keys())
+        theme_combo.addItems(theme_names)
+        current_theme = getattr(self, '_theme_name', theme_names[0])
+        if current_theme in theme_names:
+            theme_combo.setCurrentText(current_theme)
+        appearance_layout.addWidget(theme_combo)
 
-        # ── Tab 2: Updates ──────────────────────────────────────────────────
+        # Font selection
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("Font:"))
+        font_combo = QComboBox()
+        available_fonts = sorted(QFontDatabase.families())
+        font_combo.addItems(["(default)"] + available_fonts)
+        current_ff = self._theme.get("font_family", "")
+        font_combo.setCurrentText(current_ff if current_ff else "(default)")
+        font_row.addWidget(font_combo)
+        appearance_layout.addLayout(font_row)
+
+        # Font size
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Font size:"))
+        size_spin = QSpinBox()
+        size_spin.setRange(8, 36)
+        size_spin.setValue(int(self._theme.get("font_size", 13)))
+        size_row.addWidget(size_spin)
+        appearance_layout.addLayout(size_row)
+
+        appearance_layout.addStretch()
+        appearance_widget.setLayout(appearance_layout)
+        tabs.addTab(appearance_widget, "Appearance")
+
+        # ── Tab 3: Advanced Appearance ──
+        from copy import deepcopy
+        adv_scroll = QScrollArea()
+        adv_scroll.setWidgetResizable(True)
+        adv_inner = QWidget()
+        adv_layout = QVBoxLayout()
+        adv_layout.setSpacing(6)
+
+        # Color pickers
+        color_settings = [
+            ("window_bg",      "Window background:"),
+            ("panel_bg",       "Panel / widget background:"),
+            ("header_bg",      "Header background:"),
+            ("chat_bg",        "Chat area background:"),
+            ("input_bg",       "Input background:"),
+            ("border_color",   "Border / separator:"),
+            ("text_color",     "Main text:"),
+            ("button_bg",      "Button background:"),
+            ("button_border",  "Button border:"),
+            ("button_text",    "Button text:"),
+            ("timestamp_color", "Timestamp colour:"),
+            ("link_color",     "Link colour:"),
+            ("msg_own_name",   "Your username colour:"),
+            ("msg_other_name", "Other username colour:"),
+            ("msg_own_text",   "Your message text:"),
+            ("msg_other_text", "Other message text:"),
+            ("system_color",   "System message colour:")
+        ]
+        color_buttons = {}
+        for key, label in color_settings:
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setMinimumWidth(200)
+            row.addWidget(lbl)
+            swatch = QPushButton()
+            swatch.setFixedSize(24, 24)
+            current_color = self._theme.get(key, "#ffffff")
+            swatch.setStyleSheet(
+                f"background-color:{current_color};border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
+            )
+            color_label = QLabel(current_color)
+            color_label.setMinimumWidth(76)
+            def _make_clicker(k, sw, cl):
+                def _click():
+                    from PyQt6.QtGui import QColor
+                    c = QColorDialog.getColor(QColor(self._theme.get(k, "#ffffff")), dialog, "Pick colour")
+                    if c.isValid():
+                        hex_val = c.name()
+                        self._theme[k] = hex_val
+                        sw.setStyleSheet(
+                            f"background-color:{hex_val};border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
+                        )
+                        cl.setText(hex_val)
+                        self._apply_theme()
+                return _click
+            swatch.clicked.connect(_make_clicker(key, swatch, color_label))
+            row.addWidget(swatch)
+            row.addWidget(color_label)
+            row.addStretch()
+            adv_layout.addLayout(row)
+            color_buttons[key] = (swatch, color_label)
+
+        # Font family (advanced)
+        adv_font_row = QHBoxLayout()
+        adv_font_row.addWidget(QLabel("Font family:"))
+        adv_font_combo = QComboBox()
+        adv_font_combo.addItems(["(default)"] + available_fonts)
+        adv_font_combo.setCurrentText(current_ff if current_ff else "(default)")
+        adv_font_row.addWidget(adv_font_combo)
+        adv_font_row.addStretch()
+        adv_layout.addLayout(adv_font_row)
+
+        # Font size (advanced)
+        adv_size_row = QHBoxLayout()
+        adv_size_row.addWidget(QLabel("Font size (px):"))
+        adv_size_spin = QSpinBox()
+        adv_size_spin.setRange(8, 28)
+        adv_size_spin.setValue(int(self._theme.get("font_size", 13)))
+        adv_size_row.addWidget(adv_size_spin)
+        adv_size_row.addStretch()
+        adv_layout.addLayout(adv_size_row)
+
+        # Extra style controls (advanced)
+        weight_row = QHBoxLayout()
+        weight_row.addWidget(QLabel("Font weight:"))
+        weight_spin = QSpinBox()
+        weight_spin.setRange(100, 900)
+        weight_spin.setSingleStep(100)
+        weight_spin.setValue(int(self._theme.get("font_weight", 600)))
+        weight_row.addWidget(weight_spin)
+        weight_row.addStretch()
+        adv_layout.addLayout(weight_row)
+
+        radius_row = QHBoxLayout()
+        radius_row.addWidget(QLabel("Widget corner radius:"))
+        widget_radius_spin = QSpinBox()
+        widget_radius_spin.setRange(0, 24)
+        widget_radius_spin.setValue(int(self._theme.get("widget_radius", 8)))
+        radius_row.addWidget(widget_radius_spin)
+        radius_row.addStretch()
+        adv_layout.addLayout(radius_row)
+
+        button_radius_row = QHBoxLayout()
+        button_radius_row.addWidget(QLabel("Button corner radius:"))
+        button_radius_spin = QSpinBox()
+        button_radius_spin.setRange(0, 24)
+        button_radius_spin.setValue(int(self._theme.get("button_radius", 8)))
+        button_radius_row.addWidget(button_radius_spin)
+        button_radius_row.addStretch()
+        adv_layout.addLayout(button_radius_row)
+
+        border_row = QHBoxLayout()
+        border_row.addWidget(QLabel("Border width:"))
+        border_width_spin = QSpinBox()
+        border_width_spin.setRange(1, 4)
+        border_width_spin.setValue(int(self._theme.get("border_width", 1)))
+        border_row.addWidget(border_width_spin)
+        border_row.addStretch()
+        adv_layout.addLayout(border_row)
+
+        timestamp_row = QHBoxLayout()
+        timestamp_row.addWidget(QLabel("Timestamp size (px):"))
+        timestamp_spin = QSpinBox()
+        timestamp_spin.setRange(8, 22)
+        timestamp_spin.setValue(int(self._theme.get("timestamp_size", 11)))
+        timestamp_row.addWidget(timestamp_spin)
+        timestamp_row.addStretch()
+        adv_layout.addLayout(timestamp_row)
+
+        name_weight_row = QHBoxLayout()
+        name_weight_row.addWidget(QLabel("Username weight:"))
+        name_weight_spin = QSpinBox()
+        name_weight_spin.setRange(100, 900)
+        name_weight_spin.setSingleStep(100)
+        name_weight_spin.setValue(int(self._theme.get("username_weight", 700)))
+        name_weight_row.addWidget(name_weight_spin)
+        name_weight_row.addStretch()
+        adv_layout.addLayout(name_weight_row)
+
+        spacing_row = QHBoxLayout()
+        spacing_row.addWidget(QLabel("Message spacing:"))
+        message_spacing_spin = QSpinBox()
+        message_spacing_spin.setRange(0, 20)
+        message_spacing_spin.setValue(int(self._theme.get("message_spacing", 4)))
+        spacing_row.addWidget(message_spacing_spin)
+        spacing_row.addStretch()
+        adv_layout.addLayout(spacing_row)
+
+        italic_row = QHBoxLayout()
+        system_italic_chk = QCheckBox("Italic system messages")
+        system_italic_chk.setChecked(bool(self._theme.get("system_italic", True)))
+        italic_row.addWidget(system_italic_chk)
+        italic_row.addStretch()
+        adv_layout.addLayout(italic_row)
+
+        imgw_row = QHBoxLayout()
+        imgw_row.addWidget(QLabel("Image max width (px):"))
+        image_width_spin = QSpinBox()
+        image_width_spin.setRange(120, 1600)
+        image_width_spin.setValue(int(self._theme.get("image_max_width", 420)))
+        imgw_row.addWidget(image_width_spin)
+        imgw_row.addStretch()
+        adv_layout.addLayout(imgw_row)
+
+        imgh_row = QHBoxLayout()
+        imgh_row.addWidget(QLabel("Image max height (px):"))
+        image_height_spin = QSpinBox()
+        image_height_spin.setRange(120, 1200)
+        image_height_spin.setValue(int(self._theme.get("image_max_height", 320)))
+        imgh_row.addWidget(image_height_spin)
+        imgh_row.addStretch()
+        adv_layout.addLayout(imgh_row)
+
+        imgr_row = QHBoxLayout()
+        imgr_row.addWidget(QLabel("Image corner radius:"))
+        image_radius_spin = QSpinBox()
+        image_radius_spin.setRange(0, 24)
+        image_radius_spin.setValue(int(self._theme.get("image_radius", 6)))
+        imgr_row.addWidget(image_radius_spin)
+        imgr_row.addStretch()
+        adv_layout.addLayout(imgr_row)
+
+        split_row = QHBoxLayout()
+        split_row.addWidget(QLabel("Splitter handle size:"))
+        splitter_size_spin = QSpinBox()
+        splitter_size_spin.setRange(4, 24)
+        splitter_size_spin.setValue(int(self._theme.get("splitter_handle_size", 8)))
+        split_row.addWidget(splitter_size_spin)
+        split_row.addStretch()
+        adv_layout.addLayout(split_row)
+
+        # Apply / Reset buttons
+        btn_row = QHBoxLayout()
+        apply_theme_btn = QPushButton("Apply && Save")
+        reset_theme_btn = QPushButton("Reset to Default")
+        btn_row.addWidget(apply_theme_btn)
+        btn_row.addWidget(reset_theme_btn)
+        adv_layout.addLayout(btn_row)
+        adv_layout.addStretch()
+
+        adv_inner.setLayout(adv_layout)
+        adv_scroll.setWidget(adv_inner)
+        tabs.addTab(adv_scroll, "Advanced Appearance")
+
+        # ── Tab 4: Chat ──
+        chat_widget = QWidget()
+        chat_layout = QVBoxLayout()
+        chat_layout.addWidget(QLabel("Batch Load Limit (messages per batch):"))
+        message_limit_spin = QSpinBox()
+        message_limit_spin.setRange(5, 500)
+        message_limit_spin.setValue(getattr(self, "message_limit", 30))
+        chat_layout.addWidget(message_limit_spin)
+        chat_layout.addStretch()
+        chat_widget.setLayout(chat_layout)
+        tabs.addTab(chat_widget, "Chat")
+
+        # ── Tab 5: Updates ──
         updates_widget = QWidget()
         updates_layout = QVBoxLayout()
-        updates_layout.addWidget(QLabel(f"Current client version: v{CLIENT_VERSION}"))
-
-        update_status_label = QLabel("Checking status: not checked yet")
+        updates_layout.addWidget(QLabel("Check for and install updates."))
+        update_status_label = QLabel(f"Current client version: v{CLIENT_VERSION}\nChecking status: not checked yet")
         update_status_label.setWordWrap(True)
         updates_layout.addWidget(update_status_label)
-
         check_updates_btn = QPushButton("Check for Updates")
         install_update_btn = QPushButton("Download && Install Update")
         updates_layout.addWidget(check_updates_btn)
         updates_layout.addWidget(install_update_btn)
         updates_layout.addStretch()
+        updates_widget.setLayout(updates_layout)
+        tabs.addTab(updates_widget, "Updates")
 
         def _render_update_status(success=None, payload=None):
             info = payload if isinstance(payload, dict) else self._pending_update_info
@@ -3515,13 +3801,11 @@ class ChatWindow(QMainWindow):
                 update_status_label.setText(f"Update check failed: {payload}")
                 return
             if not isinstance(info, dict) or not info:
-                update_status_label.setText("Checking status: not checked yet")
+                update_status_label.setText(f"Current client version: v{CLIENT_VERSION}\nChecking status: not checked yet")
                 return
-
             if info.get("configured") is False:
                 update_status_label.setText("Updates are not configured on this server.")
                 return
-
             latest = str(info.get("latest_version", "unknown"))
             if info.get("update_available"):
                 update_status_label.setText(
@@ -3533,6 +3817,38 @@ class ChatWindow(QMainWindow):
         def _on_check_click():
             update_status_label.setText("Checking for updates...")
             self.check_for_updates(manual=True, done_callback=_render_update_status)
+        def _on_install_click():
+            if not self._pending_update_info.get("update_available"):
+                self.append_system_message("No update available to install.")
+                _render_update_status(True, self._pending_update_info)
+                return
+            update_status_label.setText("Downloading update from server...")
+            self.install_update_from_server(done_callback=lambda s, p: _render_update_status(s, self._pending_update_info))
+        check_updates_btn.clicked.connect(_on_check_click)
+        install_update_btn.clicked.connect(_on_install_click)
+        _render_update_status()
+
+        # Accept/Cancel/Apply logic
+        outer.addWidget(tabs)
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        def on_accept():
+            # Save theme (basic tab)
+            self._theme_name = theme_combo.currentText()
+            self._theme = deepcopy(_THEME_PRESETS[self._theme_name])
+            # Font and size (basic tab)
+            ff = font_combo.currentText()
+            self._theme["font_family"] = "" if ff == "(default)" else ff
+            self._theme["font_size"] = size_spin.value()
+            # Save batch limit
+            self.message_limit = message_limit_spin.value()
+            self.setStyleSheet(self._build_stylesheet())
+            self._save_user_settings()
+            dialog.accept()
+        btn_box.accepted.connect(on_accept)
+        btn_box.rejected.connect(dialog.reject)
+        outer.addWidget(btn_box)
+        dialog.setLayout(outer)
+        dialog.show()
 
         def _on_install_click():
             if not self._pending_update_info.get("update_available"):
@@ -3631,8 +3947,18 @@ class ChatWindow(QMainWindow):
         _make_basic_color_row("panel_bg", "Panel background:")
         _make_basic_color_row("chat_bg", "Chat background:")
         _make_basic_color_row("input_bg", "Input background:")
-        _make_basic_color_row("text_color", "Text colour:")
+        _make_basic_color_row("border_color", "Border / separator:")
+        _make_basic_color_row("text_color", "Main text:")
         _make_basic_color_row("button_bg", "Button background:")
+        _make_basic_color_row("button_border", "Button border:")
+        _make_basic_color_row("button_text", "Button text:")
+        _make_basic_color_row("timestamp_color", "Timestamp colour:")
+        _make_basic_color_row("link_color", "Link colour:")
+        _make_basic_color_row("msg_own_name", "Your username colour:")
+        _make_basic_color_row("msg_other_name", "Other username colour:")
+        _make_basic_color_row("msg_own_text", "Your message text:")
+        _make_basic_color_row("msg_other_text", "Other message text:")
+        _make_basic_color_row("system_color", "System message colour:")
 
         def _theme_from_preset_name(name: str) -> Dict:
             preset_data = _THEME_PRESETS.get(name, {})
@@ -3646,9 +3972,9 @@ class ChatWindow(QMainWindow):
             if "input_bg" not in preset_data:
                 merged["input_bg"] = merged.get("panel_bg", _THEME_DEFAULTS["panel_bg"])
             if "button_text" not in preset_data:
-                merged["button_text"] = merged.get("text_color", _THEME_DEFAULTS["text_color"])
+                merged["button_text"] = merged.get("text_color", _THEME_DEFAULTS["button_text"])
             if "timestamp_color" not in preset_data:
-                merged["timestamp_color"] = merged.get("system_color", _THEME_DEFAULTS["system_color"])
+                merged["timestamp_color"] = merged.get("system_color", _THEME_DEFAULTS["timestamp_color"])
             if "link_color" not in preset_data:
                 merged["link_color"] = merged.get("msg_other_name", _THEME_DEFAULTS["link_color"])
             if "msg_own_text" not in preset_data:
@@ -3686,7 +4012,7 @@ class ChatWindow(QMainWindow):
             self._theme = self._sanitize_theme(self._theme)
             self._apply_theme()
             self._save_user_settings()
-            self.load_messages()
+            self._rebuild_chat_display()
 
         def _reset_basic():
             self._theme = copy.deepcopy(_THEME_DEFAULTS)
@@ -3719,23 +4045,23 @@ class ChatWindow(QMainWindow):
 
         # Color pickers
         color_settings = [
-            ("window_bg",      "Window background"),
-            ("panel_bg",       "Panel / widget background"),
-            ("header_bg",      "Header background"),
-            ("chat_bg",        "Chat area background"),
-            ("input_bg",       "Input background"),
-            ("border_color",   "Border / separator"),
-            ("text_color",     "Main text"),
-            ("button_bg",      "Button background"),
-            ("button_border",  "Button border"),
-            ("button_text",    "Button text"),
-            ("timestamp_color", "Timestamp colour"),
-            ("link_color",     "Link colour"),
-            ("msg_own_name",   "Your username colour"),
-            ("msg_other_name", "Other username colour"),
-            ("msg_own_text",   "Your message text"),
-            ("msg_other_text", "Other message text"),
-            ("system_color",   "System message colour"),
+            ("window_bg",      "Window background:"),
+            ("panel_bg",       "Panel / widget background:"),
+            ("header_bg",      "Header background:"),
+            ("chat_bg",        "Chat area background:"),
+            ("input_bg",       "Input background:"),
+            ("border_color",   "Border / separator:"),
+            ("text_color",     "Main text:"),
+            ("button_bg",      "Button background:"),
+            ("button_border",  "Button border:"),
+            ("button_text",    "Button text:"),
+            ("timestamp_color", "Timestamp colour:"),
+            ("link_color",     "Link colour:"),
+            ("msg_own_name",   "Your username colour:"),
+            ("msg_other_name", "Other username colour:"),
+            ("msg_own_text",   "Your message text:"),
+            ("msg_other_text", "Other message text:"),
+            ("system_color",   "System message colour:")
         ]
 
         color_buttons: Dict[str, tuple] = {}
@@ -4000,7 +4326,7 @@ class ChatWindow(QMainWindow):
             self._theme = self._sanitize_theme(self._theme)
             self._apply_theme()
             self._save_user_settings()
-            self.load_messages()
+            self._rebuild_chat_display()
 
         apply_theme_btn.clicked.connect(_apply_and_save)
 
@@ -4070,12 +4396,25 @@ class ChatWindow(QMainWindow):
         _sync_controls_from_theme()
 
         outer.addWidget(tabs)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dialog.accept)
-        outer.addWidget(close_btn)
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        def on_accept():
+            # Save theme (basic tab)
+            self._theme_name = theme_combo.currentText()
+            self._theme = deepcopy(_THEME_PRESETS[self._theme_name])
+            # Font and size (basic tab)
+            ff = font_combo.currentText()
+            self._theme["font_family"] = "" if ff == "(default)" else ff
+            self._theme["font_size"] = size_spin.value()
+            # Save batch limit
+            self.message_limit = message_limit_spin.value()
+            self.setStyleSheet(self._build_stylesheet())
+            self._save_user_settings()
+            dialog.accept()
+        btn_box.accepted.connect(on_accept)
+        btn_box.rejected.connect(dialog.reject)
+        outer.addWidget(btn_box)
         dialog.setLayout(outer)
         dialog.exec()
-        # Persist any already-applied theme/sound changes when settings closes.
         self._save_user_settings()
 
     def _resolve_settings_path(self) -> Path:
