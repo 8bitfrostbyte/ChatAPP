@@ -245,6 +245,20 @@ def _save_server_url(server_url: str):
 
 
 class APIClient:
+    def get_room_message_count(self, room_id: int) -> int:
+        """Get the total number of messages in a room."""
+        try:
+            response = requests.get(
+                f"{self.server_url}/api/rooms/{room_id}/messages/count",
+                headers=self._get_headers(),
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return int(data.get("count", 0))
+        except Exception:
+            pass
+        return 0
     """Client for interacting with the server REST API."""
     
     def __init__(self, server_url: str):
@@ -1039,22 +1053,40 @@ class ChatBrowser(QTextBrowser):
     def loadResource(self, resource_type, url):
         if resource_type == 2:  # QTextDocument.ResourceType.ImageResource
             key = url.toString()
+            # Use a retry counter in the URL query (?retry=N)
+            retry_count = 0
+            if url.hasQuery():
+                try:
+                    for part in url.query().split('&'):
+                        if part.startswith('retry='):
+                            retry_count = int(part.split('=')[1])
+                except Exception:
+                    retry_count = 0
             data = ChatBrowser._image_store.get(key)
             if data is not None:
                 from PyQt6.QtGui import QImage
                 img = QImage()
-                img.loadFromData(data)
+                if not img.loadFromData(data):
+                    print(f"[ERROR] Failed to load image data for key: {key}")
+                    # Retry up to 2 times if not already retried
+                    if retry_count < 2:
+                        # Re-request with incremented retry count
+                        new_url = QUrl(url)
+                        q = new_url.query()
+                        if 'retry=' in q:
+                            q = '&'.join([p if not p.startswith('retry=') else f'retry={retry_count+1}' for p in q.split('&')])
+                        else:
+                            q = (q + '&' if q else '') + f'retry={retry_count+1}'
+                        new_url.setQuery(q)
+                        return self.loadResource(resource_type, new_url)
+                    return self._fallback_image()
                 return img
             # Lazy load: try to fetch and cache the image if not present
-            # Find the parent window to access _cache_image_url
             parent = self.parent()
             while parent and not hasattr(parent, '_cache_image_url'):
                 parent = parent.parent() if hasattr(parent, 'parent') else None
             if parent and hasattr(parent, '_cache_image_url'):
                 # Try to find the original URL from the key
-                import re
-                # The key is 'chatimg://<md5>', so we need to map it back
-                # We'll try all known URLs in the parent's _image_cache
                 for url_str, cache_key in getattr(parent, '_image_cache', {}).items():
                     if cache_key == key:
                         parent._cache_image_url(url_str)
@@ -1062,11 +1094,49 @@ class ChatBrowser(QTextBrowser):
                         if data is not None:
                             from PyQt6.QtGui import QImage
                             img = QImage()
-                            img.loadFromData(data)
+                            if not img.loadFromData(data):
+                                print(f"[ERROR] Failed to load image data for key (lazy): {key}")
+                                # Retry up to 2 times if not already retried
+                                if retry_count < 2:
+                                    new_url = QUrl(url)
+                                    q = new_url.query()
+                                    if 'retry=' in q:
+                                        q = '&'.join([p if not p.startswith('retry=') else f'retry={retry_count+1}' for p in q.split('&')])
+                                    else:
+                                        q = (q + '&' if q else '') + f'retry={retry_count+1}'
+                                    new_url.setQuery(q)
+                                    return self.loadResource(resource_type, new_url)
+                                return self._fallback_image()
                             return img
                         break
-            # Optionally, could trigger a repaint or reload here
+            print(f"[ERROR] Image not found in cache for key: {key}")
+            # Retry up to 2 times if not already retried
+            if retry_count < 2:
+                new_url = QUrl(url)
+                q = new_url.query()
+                if 'retry=' in q:
+                    q = '&'.join([p if not p.startswith('retry=') else f'retry={retry_count+1}' for p in q.split('&')])
+                else:
+                    q = (q + '&' if q else '') + f'retry={retry_count+1}'
+                new_url.setQuery(q)
+                return self.loadResource(resource_type, new_url)
+            return self._fallback_image()
         return super().loadResource(resource_type, url)
+
+    def _fallback_image(self):
+        # Return a simple 32x32 red X image as a fallback
+        from PyQt6.QtGui import QImage, QPainter, QColor, QPen
+        size = 32
+        img = QImage(size, size, QImage.Format.Format_ARGB32)
+        img.fill(QColor("white"))
+        painter = QPainter(img)
+        pen = QPen(QColor("red"))
+        pen.setWidth(4)
+        painter.setPen(pen)
+        painter.drawLine(0, 0, size, size)
+        painter.drawLine(0, size, size, 0)
+        painter.end()
+        return img
 
 
 
@@ -1077,7 +1147,30 @@ class ChatWindow(QMainWindow):
         if scrollbar.value() == scrollbar.minimum():
             # User scrolled to the top, load older messages if not busy
             if not self._busy:
-                self._load_older_messages()
+                self.set_busy(True)
+                def fetch_batch():
+                    # Returns (ok, older_messages, loaded_count)
+                    if not self.current_room:
+                        return False, [], 0
+                    loaded_count = len(self._chat_raw_messages)
+                    batch_size = getattr(self, "message_limit", 30)
+                    offset = loaded_count
+                    ok, older_messages = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
+                    return ok, older_messages, loaded_count
+                def after_fetch(result):
+                    ok, older_messages, loaded_count = result if result else (False, [], 0)
+                    if ok and older_messages:
+                        self._chat_raw_messages = list(older_messages) + self._chat_raw_messages
+                        prev_scroll_value = self.message_display.verticalScrollBar().value()
+                        prev_max = self.message_display.verticalScrollBar().maximum()
+                        self._rebuild_chat_display()
+                        new_max = self.message_display.verticalScrollBar().maximum()
+                        self.message_display.verticalScrollBar().setValue(new_max - prev_max + prev_scroll_value)
+                    self.set_busy(False)
+                worker = WorkerThread(fetch_batch)
+                worker.result.connect(after_fetch)
+                self._workers.append(worker)
+                worker.start()
 
     def _load_older_messages(self):
         """Fetch and prepend older messages to the chat display."""
@@ -1954,7 +2047,8 @@ class ChatWindow(QMainWindow):
                     break
                 offset += batch_size
         else:
-            messages = self._chat_raw_messages
+            # Use all currently loaded messages in the chat window
+            messages = list(self._chat_raw_messages)
 
         # Filter for bot messages if requested
         if bot_only:
@@ -2010,14 +2104,33 @@ class ChatWindow(QMainWindow):
 
         try:
             response = requests.get(url, timeout=8)
-            response.raise_for_status()
+            print(f"[DEBUG] Fetching image: {url}")
+            print(f"[DEBUG] HTTP status: {response.status_code}")
+            print(f"[DEBUG] Response headers: {response.headers}")
+            if response.status_code != 200:
+                print(f"[ERROR] Non-200 status code for image: {url}")
+                print(f"[ERROR] Response text (first 200 chars): {response.text[:200]}")
+                return None
+            content_type = response.headers.get('Content-Type', '')
+            print(f"[DEBUG] Content-Type: {content_type}")
+            print(f"[DEBUG] Content-Length: {len(response.content)} bytes")
+            # Optionally, try to open with PIL for diagnostics
+            try:
+                from PIL import Image
+                from io import BytesIO
+                img = Image.open(BytesIO(response.content))
+                img.verify()
+                print(f"[DEBUG] PIL image format: {img.format}, size: {img.size}")
+            except Exception as pil_e:
+                print(f"[ERROR] PIL could not open image: {pil_e}")
 
             import hashlib
             key = "chatimg://" + hashlib.md5(url.encode()).hexdigest()
             ChatBrowser._image_store[key] = response.content
             self._image_cache[url] = key
             return key
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Failed to fetch image from URL: {url}\nReason: {e}")
             return None
 
     def _build_message_body_html(self, content: str, embedded_sources: Optional[Dict[str, str]] = None) -> str:
@@ -2046,15 +2159,17 @@ class ChatWindow(QMainWindow):
         image_h = int(self._theme.get("image_max_height", 320))
         image_r = int(self._theme.get("image_radius", 6))
         for url in image_urls:
-            src = embedded_sources.get(url)
-            if src:
+            src = embedded_sources.get(url) if embedded_sources else None
+            # Always emit <img> tag for every image URL, using src if available, else the raw URL
+            img_src = src if src else url
+            images_html.append(
+                f'<img src="{img_src}" style="max-width:{image_w}px;max-height:{image_h}px;'
+                f'border-radius:{image_r}px;display:block;margin:8px 0;">'
+            )
+            # Optionally, also show the clickable link if image is missing from cache
+            if not (src and src in ChatBrowser._image_store):
                 images_html.append(
-                    f'<img src="{src}" style="max-width:{image_w}px;max-height:{image_h}px;'
-                    f'border-radius:{image_r}px;display:block;margin:8px 0;">'
-                )
-            else:
-                images_html.append(
-                    f'<a href="{url}" style="color:{link_color};text-decoration:none;word-break:break-all;">{html.escape(url)}</a>'
+                    f'<a href="{url}" style="color:{link_color};text-decoration:none;word-break:break-all;">[Image not loaded - click to open]<br>{html.escape(url)}</a>'
                 )
 
         if text_html and images_html:
@@ -2166,17 +2281,23 @@ class ChatWindow(QMainWindow):
             "attachment": attachment,
         })
 
-        # Collect image URLs from both message content and attachment
+        # Only render as image if there are valid image URLs or image attachments
         image_urls = set(self._extract_image_urls(content))
         if attachment and attachment.get("file_url"):
             file_url = attachment["file_url"]
             file_type = (attachment.get("file_type") or "").lower()
-            # Only treat as image if file_type is image/* or file extension is image-like
             if file_type.startswith("image/") or any(file_url.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]):
                 image_urls.add(file_url)
 
+        # Skip rendering bot tag/metadata-only messages (no image URLs, from ImageBot, and content is just tags)
+        if (
+            str(username).lower() == "imagebot"
+            and not image_urls
+            and (msg_type == "text" or msg_type == "bot")
+        ):
+            return
+
         if msg_type != "system" and image_urls:
-            # Show placeholder immediately (preserves message order), then rebuild once image is cached.
             body_html = self._build_message_body_html(content, {})
             self.message_display.append(self.format_message_html(username, body_html, msg_type))
 
@@ -2224,12 +2345,10 @@ class ChatWindow(QMainWindow):
             sources = {}
             for url in urls:
                 if url in self._image_cache:
-                    sources[url] = self._image_cache[url]
-                else:
-                    # Generate the cache key for this URL
-                    import hashlib
-                    key = "chatimg://" + hashlib.md5(url.encode()).hexdigest()
-                    self._image_cache[url] = key
+                    key = self._image_cache[url]
+                    if key is not None:
+                        sources[url] = key
+                # else: do not pre-populate the cache; let _cache_image_url handle it
                     sources[url] = key
             body_html = self._build_message_body_html(c, sources)
             if urls:
@@ -2351,7 +2470,11 @@ class ChatWindow(QMainWindow):
             if not ok_join:
                 print("join_room failed")
                 return None
-            ok_msgs, messages = self.api_client.get_messages(rid, limit=30)
+            # Fetch the most recent messages (not the oldest)
+            message_limit = getattr(self, "message_limit", 30)
+            total_count = self.api_client.get_room_message_count(rid)
+            offset = max(0, total_count - message_limit)
+            ok_msgs, messages = self.api_client.get_messages(rid, limit=message_limit, offset=offset)
             ok_mbrs, members = self.api_client.get_room_members(rid)
             print("Fetched messages:", messages)
             print("Fetched members:", members)
@@ -2379,6 +2502,8 @@ class ChatWindow(QMainWindow):
                 attachment = self._extract_attachment_from_message(msg)
                 self.append_chat_message(username, content, msg_type, attachment)
             self._schedule_chat_rebuild()  # Ensure UI is rebuilt after loading messages
+            # Scroll to bottom after loading messages
+            QTimer.singleShot(0, lambda: self.message_display.verticalScrollBar().setValue(self.message_display.verticalScrollBar().maximum()))
             self._update_members(result["members"])
             self.connect_websocket()
 
@@ -2399,6 +2524,23 @@ class ChatWindow(QMainWindow):
             return  # No more messages to load
         # Prepend older messages to the raw message list
         self._chat_raw_messages = list(older_messages) + self._chat_raw_messages
+        # Proactively cache images for all image URLs in the newly loaded messages
+        for msg in older_messages:
+            if not isinstance(msg, dict):
+                continue
+            msg_type = msg.get("msg_type") or msg.get("message_type", "text")
+            if msg_type == "system":
+                continue
+            content = str(msg.get("content", ""))
+            image_urls = self._extract_image_urls(content)
+            attachment = msg.get("attachment")
+            if attachment and attachment.get("file_url"):
+                file_url = attachment["file_url"]
+                file_type = (attachment.get("file_type") or "").lower()
+                if file_type.startswith("image/") or any(file_url.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]):
+                    image_urls.append(file_url)
+            for url in image_urls:
+                self._cache_image_url(url)
         # Rebuild the chat display, preserving scroll position
         prev_scroll_value = self.message_display.verticalScrollBar().value()
         prev_max = self.message_display.verticalScrollBar().maximum()
@@ -2473,10 +2615,25 @@ class ChatWindow(QMainWindow):
                 self.message_input.clear()
                 return
 
-            self.append_system_message(result.get("message", "Messages cleared"))
+            # System message with number of cleared messages
+            cleared_count = count if isinstance(result, dict) and result.get("success", True) else 0
+            # Add system message to chat history and update display
+            self._chat_raw_messages.append({
+                "username": "SYSTEM",
+                "content": f"Cleared {cleared_count} message(s) from chat.",
+                "msg_type": "system",
+                "attachment": None,
+            })
             # Reload messages after clearing
             ok_msgs, messages = self.api_client.get_messages(self.current_room, limit=self.message_limit)
             self._chat_raw_messages = list(messages) if ok_msgs else []
+            # Re-add the system message at the end
+            self._chat_raw_messages.append({
+                "username": "SYSTEM",
+                "content": f"Cleared {cleared_count} message(s) from chat.",
+                "msg_type": "system",
+                "attachment": None,
+            })
             self._rebuild_chat_display()
             self.message_input.clear()
             return
@@ -2498,10 +2655,10 @@ class ChatWindow(QMainWindow):
                 folder_arg = parts[idx].strip()
 
             success, result = self._save_images_from_chat(folder_arg, save_all=save_all, bot_only=bot_only)
+            saved = result.get('saved', 0) if isinstance(result, dict) else 0
+            failed = result.get('failed', 0) if isinstance(result, dict) else 0
+            folder = result.get('folder', '') if isinstance(result, dict) else ''
             if not success:
-                saved = result.get('saved', 0) if isinstance(result, dict) else 0
-                failed = result.get('failed', 0) if isinstance(result, dict) else 0
-                folder = result.get('folder', '') if isinstance(result, dict) else ''
                 self.append_system_message(
                     f"Saved {saved} image(s)"
                     f" ({failed} failed)" if failed else ''
@@ -2510,9 +2667,8 @@ class ChatWindow(QMainWindow):
                 )
             else:
                 self.append_system_message(
-                    f"Saved {result['saved']} image(s)"
-                    f" ({result['failed']} failed)" if result['failed'] else ''
-                    f" to {result['folder']}"
+                    f"Saved {saved} image(s) to {folder}."
+                    + (f" ({failed} failed)" if failed else "")
                 )
             self.message_input.clear()
             return
@@ -2741,6 +2897,30 @@ class ChatWindow(QMainWindow):
                 self.append_system_message(
                     f"Bot stream started: every {interval:g}s | mode: {mode} | tags: {', '.join(pool) if pool else 'rating:explicit'}"
                 )
+                # Immediately fetch and display the first bot image after stream starts
+                def _image_success(img_result):
+                    # img_result is the payload from fetch_bot_images
+                    if not img_result or not isinstance(img_result, dict):
+                        self.append_system_message("Failed to fetch initial bot image.")
+                        return
+                    images = img_result.get("images") or img_result.get("results") or []
+                    if not images:
+                        self.append_system_message("No bot images available.")
+                        return
+                    # Use the first image
+                    image = images[0]
+                    image_url = image.get("url") or image.get("file_url")
+                    image_tags = image.get("tags")
+                    pretty_tags = image_tags if image_tags else "(no tags)"
+                    payload = f"Tags: {pretty_tags}\n{image_url}"
+                    if self.websocket_thread and self.websocket_thread.client:
+                        self.websocket_thread.send_message(payload)
+                        self.append_system_message("Bot image sent to room.")
+                    else:
+                        self.append_system_message(payload)
+
+                # Use the same tags as the stream, or None
+                _run_bot_request(self.api_client.fetch_bot_images, _image_success, "Bot image fetch failed", tags or "", 1)
 
             _run_bot_request(
                 self.api_client.start_bot_stream,
