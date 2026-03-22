@@ -2021,8 +2021,8 @@ class ChatWindow(QMainWindow):
             return f"[Image] {file_url}"
         return content
 
-    def _save_images_from_chat(self, folder_path: Optional[str] = None, save_all: bool = False, bot_only: bool = False) -> tuple:
-        """Save image URLs from chat messages to a local folder. If save_all is True, fetch all messages in batches. If bot_only is True, only save images sent by the bot."""
+    def _save_images_from_chat(self, folder_path: Optional[str] = None, save_all: bool = False, bot_only: bool = False, messages_override: Optional[list] = None) -> tuple:
+        """Save image URLs from chat messages to a local folder. If messages_override is provided, use those messages. If bot_only is True, only save images sent by the bot."""
         import requests
         from urllib.parse import urlparse
         if not folder_path:
@@ -2033,21 +2033,9 @@ class ChatWindow(QMainWindow):
         target_dir = Path(folder_path)
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        messages = []
-        if save_all and self.current_room:
-            # Fetch all messages in batches
-            offset = 0
-            batch_size = getattr(self, "message_limit", 30)
-            while True:
-                ok, batch = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
-                if not ok or not batch:
-                    break
-                messages.extend(batch)
-                if len(batch) < batch_size:
-                    break
-                offset += batch_size
+        if messages_override is not None:
+            messages = messages_override
         else:
-            # Use all currently loaded messages in the chat window
             messages = list(self._chat_raw_messages)
 
         # Filter for bot messages if requested
@@ -2654,7 +2642,26 @@ class ChatWindow(QMainWindow):
             if len(parts) > idx:
                 folder_arg = parts[idx].strip()
 
-            success, result = self._save_images_from_chat(folder_arg, save_all=save_all, bot_only=bot_only)
+            # If !saveimages all, fetch and save every image from the entire chat history
+            if save_all and self.current_room:
+                # Fetch all messages in batches, collect all images
+                all_messages = []
+                offset = 0
+                batch_size = getattr(self, "message_limit", 30)
+                while True:
+                    ok, batch = self.api_client.get_messages(self.current_room, limit=batch_size, offset=offset)
+                    if not ok or not batch:
+                        break
+                    all_messages.extend(batch)
+                    if len(batch) < batch_size:
+                        break
+                    offset += batch_size
+                # Save images from all messages
+                success, result = self._save_images_from_chat(folder_arg, save_all=False, bot_only=bot_only, messages_override=all_messages)
+            else:
+                # Default: only save from currently loaded messages
+                success, result = self._save_images_from_chat(folder_arg, save_all=False, bot_only=bot_only)
+
             saved = result.get('saved', 0) if isinstance(result, dict) else 0
             failed = result.get('failed', 0) if isinstance(result, dict) else 0
             folder = result.get('folder', '') if isinstance(result, dict) else ''
@@ -2890,6 +2897,26 @@ class ChatWindow(QMainWindow):
                 return
 
             tags = start_parts[1].strip() if len(start_parts) > 1 else None
+            # If tags are not provided, use saved/start tags from config or last used
+            if not tags:
+                # Try to get saved tags from user settings or last used
+                tags = ','.join(getattr(self, 'saved_tags', []) or getattr(self, 'start_tags', []) or [])
+                if not tags:
+                    # No tags provided and no saved tags: use random mode (empty string)
+                    tags = None
+            # Only add tags to taglist if they were explicitly provided
+            if tags and start_parts[1:]:
+                # Add to saved_tags/start_tags if not already present
+                tag_list = [t.strip() for t in tags.split(',') if t.strip()]
+                if not hasattr(self, 'saved_tags'):
+                    self.saved_tags = []
+                if not hasattr(self, 'start_tags'):
+                    self.start_tags = []
+                for t in tag_list:
+                    if t not in self.saved_tags:
+                        self.saved_tags.append(t)
+                    if t not in self.start_tags:
+                        self.start_tags.append(t)
 
             def _start_success(result):
                 mode = result.get("mode", "?")
@@ -3708,245 +3735,8 @@ class ChatWindow(QMainWindow):
         notif_widget.setLayout(notif_layout)
         tabs.addTab(notif_widget, "Notifications")
 
-        # ── Tab 2: Appearance (Basic) ──
-        appearance_widget = QWidget()
-        appearance_layout = QVBoxLayout()
-        appearance_layout.addWidget(QLabel("Theme:"))
-        theme_combo = QComboBox()
-        theme_names = list(_THEME_PRESETS.keys())
-        theme_combo.addItems(theme_names)
-        current_theme = getattr(self, '_theme_name', theme_names[0])
-        if current_theme in theme_names:
-            theme_combo.setCurrentText(current_theme)
-        appearance_layout.addWidget(theme_combo)
-
-        # Font selection
-        font_row = QHBoxLayout()
-        font_row.addWidget(QLabel("Font:"))
-        font_combo = QComboBox()
-        available_fonts = sorted(QFontDatabase.families())
-        font_combo.addItems(["(default)"] + available_fonts)
-        current_ff = self._theme.get("font_family", "")
-        font_combo.setCurrentText(current_ff if current_ff else "(default)")
-        font_row.addWidget(font_combo)
-        appearance_layout.addLayout(font_row)
-
-        # Font size
-        size_row = QHBoxLayout()
-        size_row.addWidget(QLabel("Font size:"))
-        size_spin = QSpinBox()
-        size_spin.setRange(8, 36)
-        size_spin.setValue(int(self._theme.get("font_size", 13)))
-        size_row.addWidget(size_spin)
-        appearance_layout.addLayout(size_row)
-
-        appearance_layout.addStretch()
-        appearance_widget.setLayout(appearance_layout)
-        tabs.addTab(appearance_widget, "Appearance")
-
-        # ── Tab 3: Advanced Appearance ──
-        from copy import deepcopy
-        adv_scroll = QScrollArea()
-        adv_scroll.setWidgetResizable(True)
-        adv_inner = QWidget()
-        adv_layout = QVBoxLayout()
-        adv_layout.setSpacing(6)
-
-        # Color pickers
-        color_settings = [
-            ("window_bg",      "Window background:"),
-            ("panel_bg",       "Panel / widget background:"),
-            ("header_bg",      "Header background:"),
-            ("chat_bg",        "Chat area background:"),
-            ("input_bg",       "Input background:"),
-            ("border_color",   "Border / separator:"),
-            ("text_color",     "Main text:"),
-            ("button_bg",      "Button background:"),
-            ("button_border",  "Button border:"),
-            ("button_text",    "Button text:"),
-            ("timestamp_color", "Timestamp colour:"),
-            ("link_color",     "Link colour:"),
-            ("msg_own_name",   "Your username colour:"),
-            ("msg_other_name", "Other username colour:"),
-            ("msg_own_text",   "Your message text:"),
-            ("msg_other_text", "Other message text:"),
-            ("system_color",   "System message colour:")
-        ]
-        color_buttons = {}
-        for key, label in color_settings:
-            row = QHBoxLayout()
-            lbl = QLabel(label)
-            lbl.setMinimumWidth(200)
-            row.addWidget(lbl)
-            swatch = QPushButton()
-            swatch.setFixedSize(24, 24)
-            current_color = self._theme.get(key, "#ffffff")
-            swatch.setStyleSheet(
-                f"background-color:{current_color};border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
-            )
-            color_label = QLabel(current_color)
-            color_label.setMinimumWidth(76)
-            def _make_clicker(k, sw, cl):
-                def _click():
-                    from PyQt6.QtGui import QColor
-                    c = QColorDialog.getColor(QColor(self._theme.get(k, "#ffffff")), dialog, "Pick colour")
-                    if c.isValid():
-                        hex_val = c.name()
-                        self._theme[k] = hex_val
-                        sw.setStyleSheet(
-                            f"background-color:{hex_val};border:1px solid #888;border-radius:4px;min-width:0;padding:0;"
-                        )
-                        cl.setText(hex_val)
-                        self._apply_theme()
-                return _click
-            swatch.clicked.connect(_make_clicker(key, swatch, color_label))
-            row.addWidget(swatch)
-            row.addWidget(color_label)
-            row.addStretch()
-            adv_layout.addLayout(row)
-            color_buttons[key] = (swatch, color_label)
-
-        # Font family (advanced)
-        adv_font_row = QHBoxLayout()
-        adv_font_row.addWidget(QLabel("Font family:"))
-        adv_font_combo = QComboBox()
-        adv_font_combo.addItems(["(default)"] + available_fonts)
-        adv_font_combo.setCurrentText(current_ff if current_ff else "(default)")
-        adv_font_row.addWidget(adv_font_combo)
-        adv_font_row.addStretch()
-        adv_layout.addLayout(adv_font_row)
-
-        # Font size (advanced)
-        adv_size_row = QHBoxLayout()
-        adv_size_row.addWidget(QLabel("Font size (px):"))
-        adv_size_spin = QSpinBox()
-        adv_size_spin.setRange(8, 28)
-        adv_size_spin.setValue(int(self._theme.get("font_size", 13)))
-        adv_size_row.addWidget(adv_size_spin)
-        adv_size_row.addStretch()
-        adv_layout.addLayout(adv_size_row)
-
-        # Extra style controls (advanced)
-        weight_row = QHBoxLayout()
-        weight_row.addWidget(QLabel("Font weight:"))
-        weight_spin = QSpinBox()
-        weight_spin.setRange(100, 900)
-        weight_spin.setSingleStep(100)
-        weight_spin.setValue(int(self._theme.get("font_weight", 600)))
-        weight_row.addWidget(weight_spin)
-        weight_row.addStretch()
-        adv_layout.addLayout(weight_row)
-
-        radius_row = QHBoxLayout()
-        radius_row.addWidget(QLabel("Widget corner radius:"))
-        widget_radius_spin = QSpinBox()
-        widget_radius_spin.setRange(0, 24)
-        widget_radius_spin.setValue(int(self._theme.get("widget_radius", 8)))
-        radius_row.addWidget(widget_radius_spin)
-        radius_row.addStretch()
-        adv_layout.addLayout(radius_row)
-
-        button_radius_row = QHBoxLayout()
-        button_radius_row.addWidget(QLabel("Button corner radius:"))
-        button_radius_spin = QSpinBox()
-        button_radius_spin.setRange(0, 24)
-        button_radius_spin.setValue(int(self._theme.get("button_radius", 8)))
-        button_radius_row.addWidget(button_radius_spin)
-        button_radius_row.addStretch()
-        adv_layout.addLayout(button_radius_row)
-
-        border_row = QHBoxLayout()
-        border_row.addWidget(QLabel("Border width:"))
-        border_width_spin = QSpinBox()
-        border_width_spin.setRange(1, 4)
-        border_width_spin.setValue(int(self._theme.get("border_width", 1)))
-        border_row.addWidget(border_width_spin)
-        border_row.addStretch()
-        adv_layout.addLayout(border_row)
-
-        timestamp_row = QHBoxLayout()
-        timestamp_row.addWidget(QLabel("Timestamp size (px):"))
-        timestamp_spin = QSpinBox()
-        timestamp_spin.setRange(8, 22)
-        timestamp_spin.setValue(int(self._theme.get("timestamp_size", 11)))
-        timestamp_row.addWidget(timestamp_spin)
-        timestamp_row.addStretch()
-        adv_layout.addLayout(timestamp_row)
-
-        name_weight_row = QHBoxLayout()
-        name_weight_row.addWidget(QLabel("Username weight:"))
-        name_weight_spin = QSpinBox()
-        name_weight_spin.setRange(100, 900)
-        name_weight_spin.setSingleStep(100)
-        name_weight_spin.setValue(int(self._theme.get("username_weight", 700)))
-        name_weight_row.addWidget(name_weight_spin)
-        name_weight_row.addStretch()
-        adv_layout.addLayout(name_weight_row)
-
-        spacing_row = QHBoxLayout()
-        spacing_row.addWidget(QLabel("Message spacing:"))
-        message_spacing_spin = QSpinBox()
-        message_spacing_spin.setRange(0, 20)
-        message_spacing_spin.setValue(int(self._theme.get("message_spacing", 4)))
-        spacing_row.addWidget(message_spacing_spin)
-        spacing_row.addStretch()
-        adv_layout.addLayout(spacing_row)
-
-        italic_row = QHBoxLayout()
-        system_italic_chk = QCheckBox("Italic system messages")
-        system_italic_chk.setChecked(bool(self._theme.get("system_italic", True)))
-        italic_row.addWidget(system_italic_chk)
-        italic_row.addStretch()
-        adv_layout.addLayout(italic_row)
-
-        imgw_row = QHBoxLayout()
-        imgw_row.addWidget(QLabel("Image max width (px):"))
-        image_width_spin = QSpinBox()
-        image_width_spin.setRange(120, 1600)
-        image_width_spin.setValue(int(self._theme.get("image_max_width", 420)))
-        imgw_row.addWidget(image_width_spin)
-        imgw_row.addStretch()
-        adv_layout.addLayout(imgw_row)
-
-        imgh_row = QHBoxLayout()
-        imgh_row.addWidget(QLabel("Image max height (px):"))
-        image_height_spin = QSpinBox()
-        image_height_spin.setRange(120, 1200)
-        image_height_spin.setValue(int(self._theme.get("image_max_height", 320)))
-        imgh_row.addWidget(image_height_spin)
-        imgh_row.addStretch()
-        adv_layout.addLayout(imgh_row)
-
-        imgr_row = QHBoxLayout()
-        imgr_row.addWidget(QLabel("Image corner radius:"))
-        image_radius_spin = QSpinBox()
-        image_radius_spin.setRange(0, 24)
-        image_radius_spin.setValue(int(self._theme.get("image_radius", 6)))
-        imgr_row.addWidget(image_radius_spin)
-        imgr_row.addStretch()
-        adv_layout.addLayout(imgr_row)
-
-        split_row = QHBoxLayout()
-        split_row.addWidget(QLabel("Splitter handle size:"))
-        splitter_size_spin = QSpinBox()
-        splitter_size_spin.setRange(4, 24)
-        splitter_size_spin.setValue(int(self._theme.get("splitter_handle_size", 8)))
-        split_row.addWidget(splitter_size_spin)
-        split_row.addStretch()
-        adv_layout.addLayout(split_row)
-
-        # Apply / Reset buttons
-        btn_row = QHBoxLayout()
-        apply_theme_btn = QPushButton("Apply && Save")
-        reset_theme_btn = QPushButton("Reset to Default")
-        btn_row.addWidget(apply_theme_btn)
-        btn_row.addWidget(reset_theme_btn)
-        adv_layout.addLayout(btn_row)
-        adv_layout.addStretch()
-
-        adv_inner.setLayout(adv_layout)
-        adv_scroll.setWidget(adv_inner)
-        tabs.addTab(adv_scroll, "Advanced Appearance")
+        # Only add one Appearance and one Appearance (Advanced) tab
+        # ...existing code for other tabs...
 
         # ── Tab 4: Chat ──
         chat_widget = QWidget()

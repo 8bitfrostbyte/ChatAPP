@@ -363,23 +363,18 @@ class BotStreamManager:
                 content=content,
                 message_type="bot"
             )
-            message = Message(
-                room_id=room_id,
-                user_id=bot_user_id,
-                content=content,
-                message_type="bot"
-            )
             db.add(message)
             db.commit()
             db.refresh(message)
             print(f"[DEBUG] _post_bot_message: Saved bot message id={message.id} room_id={room_id} user_id={bot_user_id} content={content}")
+            # Always broadcast as a normal chat message (type: message_new)
             await manager.broadcast(room_id, {
                 "type": "message_new",
                 "id": message.id,
                 "user_id": bot_user_id,
                 "username": "ImageBot",
                 "content": content,
-                "message_type": "bot",
+                "message_type": "message",  # treat as normal chat message
                 "created_at": message.created_at.isoformat()
             })
             print(f"[DEBUG] _post_bot_message: Broadcasted bot message id={message.id} room_id={room_id}")

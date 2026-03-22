@@ -493,10 +493,14 @@ def fetch_image():
 # --- BACKGROUND LOOP ---
 async def _send_next_image(channel):
     """Pop one post from the buffer and send it. Returns True if sent."""
+    log_info("[DEBUG] _send_next_image called.")
     image_post = await asyncio.to_thread(fetch_image)
+    log_info(f"[DEBUG] fetch_image returned: {image_post}")
     if not image_post or not image_post.get("url"):
+        log_info("[DEBUG] No image_post or missing URL.")
         return False
     if image_post["url"] in config["history"]:
+        log_info("[DEBUG] Image already in history, skipping.")
         return False
     config["history"].append(image_post["url"])
     if len(config["history"]) > 200:
@@ -507,16 +511,22 @@ async def _send_next_image(channel):
         log_info(f"POSTED [{image_post.get('api', 'unknown')}] Tags: {pretty_tags}")
         return True
     except Exception as e:
-        log_verbose(f"Send Error: {e}")
+        log_info(f"[DEBUG] Send Error: {e}")
         return False
 
 
 @tasks.loop(seconds=30.0)
 async def image_stream():
-    if not config["channel_id"]: return
+    log_info(f"[DEBUG] image_stream tick. Channel ID: {config['channel_id']}")
+    if not config["channel_id"]:
+        log_info("[DEBUG] image_stream: No channel_id set.")
+        return
     channel = bot.get_channel(config["channel_id"])
-    if not channel: return
-    await _send_next_image(channel)
+    if not channel:
+        log_info(f"[DEBUG] image_stream: Channel not found for ID {config['channel_id']}")
+        return
+    result = await _send_next_image(channel)
+    log_info(f"[DEBUG] image_stream: _send_next_image result: {result}")
 
 # --- COMMANDS ---
 @bot.command()
