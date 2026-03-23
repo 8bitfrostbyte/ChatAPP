@@ -393,16 +393,8 @@ class BotStreamManager:
             error_streak = 0
             import random
             while True:
-                # Pick a random tag for every image
-                current_tag = random.choice(tag_pool) if tag_pool else "rating:explicit"
-                images = await asyncio.to_thread(image_bot.fetch_images, current_tag, 1)
-                image_post = images[0] if images else None
-                if not image_post or not image_post.get("url"):
-                    # Try another random tag if miss
-                    current_tag = random.choice(tag_pool) if tag_pool else "rating:explicit"
-                    fallback_images = await asyncio.to_thread(image_bot.fetch_images, current_tag, 1)
-                    image_post = fallback_images[0] if fallback_images else None
-
+                # Use the buffered random image fetcher for true randomness and non-repetition
+                image_post = await asyncio.to_thread(image_bot.fetch_buffered_image, tag_pool)
                 if image_post and image_post.get("url"):
                     msg = (
                         f"Tags: {image_bot.format_tags_for_log(image_post.get('tags', ''), max_tags=20)}\n"
@@ -430,8 +422,9 @@ class BotStreamManager:
             await self._post_bot_message(room_id, f"Image stream error: {e}")
 
     async def start_stream(self, room_id: int, interval: float, tag_pool: List[str], mode: str) -> Dict:
+        # If a stream is already running, stop it first so new tags take effect immediately
         if room_id in self.tasks and not self.tasks[room_id].done():
-            return {"started": False, "message": "Stream already running in this room"}
+            await self.stop_stream(room_id)
 
         task = asyncio.create_task(self._run_stream(room_id, interval, tag_pool, mode))
         self.tasks[room_id] = task
@@ -442,7 +435,7 @@ class BotStreamManager:
             "tag_pool": tag_pool,
             "started_at": datetime.utcnow().isoformat()
         }
-        return {"started": True, "message": "Stream started"}
+        return {"started": True, "message": "Stream started (restarted if already running)"}
 
     async def stop_stream(self, room_id: int) -> Dict:
         task = self.tasks.get(room_id)
