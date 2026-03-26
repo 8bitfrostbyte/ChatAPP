@@ -1090,39 +1090,38 @@ class ChatBrowser(QTextBrowser):
                     return self._fallback_image()
                 return img
             # If not in cache, fetch and cache the image from the URL in a background thread
-            def fetch_and_cache():
-                try:
-                    import requests
-                    response = requests.get(parsed.geturl(), timeout=8)
-                    if response.status_code == 200:
-                        ChatBrowser._image_store[key] = response.content
-                        # Trigger a repaint of the document to show the image
-                        self.document().addResource(resource_type, url, response.content)
-                        self.viewport().update()
-                    else:
-                        print(f"[ERROR] Failed to fetch image from URL: {parsed.geturl()} (status {response.status_code})")
-                except Exception as e:
-                    print(f"[ERROR] Exception fetching image from URL: {parsed.geturl()} - {e}")
-            # Only start a background fetch if not already fetching for this key
+            from PyQt6.QtCore import QRunnable, QThreadPool, QTimer, QObject, pyqtSignal
+            import requests
+            class ImageFetchTask(QRunnable):
+                def __init__(self, url, key, callback):
+                    super().__init__()
+                    self.url = url
+                    self.key = key
+                    self.callback = callback
+                def run(self):
+                    try:
+                        response = requests.get(self.url, timeout=8)
+                        if response.status_code == 200:
+                            ChatBrowser._image_store[self.key] = response.content
+                            self.callback(self.url, self.key, response.content)
+                        else:
+                            print(f"[ERROR] Failed to fetch image from URL: {self.url} (status {response.status_code})")
+                    except Exception as e:
+                        print(f"[ERROR] Exception fetching image from URL: {self.url} - {e}")
+
             if not hasattr(self, '_fetching_keys'):
                 self._fetching_keys = set()
+            if not hasattr(self, '_thread_pool'):
+                self._thread_pool = QThreadPool.globalInstance()
+                self._thread_pool.setMaxThreadCount(8)  # You can adjust this number for concurrency
             if key not in self._fetching_keys:
                 self._fetching_keys.add(key)
-                from PyQt6.QtCore import QTimer
-                from PyQt6.QtWidgets import QApplication
-                worker = WorkerThread(fetch_and_cache)
-                self._workers.append(worker)
-                def on_done(_):
+                def on_image_fetched(url, key, content):
                     self._fetching_keys.discard(key)
-                    # Remove finished worker from list
-                    try:
-                        self._workers.remove(worker)
-                    except ValueError:
-                        pass
-                    # Trigger a repaint after image is fetched
+                    self.document().addResource(resource_type, url, content)
                     QTimer.singleShot(0, self.viewport().update)
-                worker.result.connect(on_done)
-                worker.start()
+                task = ImageFetchTask(parsed.geturl(), key, on_image_fetched)
+                self._thread_pool.start(task)
             return self._fallback_image()
         return super().loadResource(resource_type, url)
 
