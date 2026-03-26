@@ -2920,44 +2920,54 @@ class ChatWindow(QMainWindow):
                     if t not in self.start_tags:
                         self.start_tags.append(t)
 
-            def _start_success(result):
-                mode = result.get("mode", "?")
-                pool = result.get("tag_pool", [])
-                self.append_system_message(
-                    f"Bot stream started: every {interval:g}s | mode: {mode} | tags: {', '.join(pool) if pool else 'rating:explicit'}"
+            # Always stop the stream before starting a new one to ensure new tags take effect
+            def _after_stop(_):
+                def _start_success(result):
+                    mode = result.get("mode", "?")
+                    pool = result.get("tag_pool", [])
+                    self.append_system_message(
+                        f"Bot stream started: every {interval:g}s | mode: {mode} | tags: {', '.join(pool) if pool else 'rating:explicit'}"
+                    )
+                    # Immediately fetch and display the first bot image after stream starts
+                    def _image_success(img_result):
+                        # img_result is the payload from fetch_bot_images
+                        if not img_result or not isinstance(img_result, dict):
+                            self.append_system_message("Failed to fetch initial bot image.")
+                            return
+                        images = img_result.get("images") or img_result.get("results") or []
+                        if not images:
+                            self.append_system_message("No bot images available.")
+                            return
+                        # Use the first image
+                        image = images[0]
+                        image_url = image.get("url") or image.get("file_url")
+                        image_tags = image.get("tags")
+                        pretty_tags = image_tags if image_tags else "(no tags)"
+                        payload = f"Tags: {pretty_tags}\n{image_url}"
+                        if self.websocket_thread and self.websocket_thread.client:
+                            self.websocket_thread.send_message(payload)
+                            self.append_system_message("Bot image sent to room.")
+                        else:
+                            self.append_system_message(payload)
+
+                    # Use the same tags as the stream, or None
+                    _run_bot_request(self.api_client.fetch_bot_images, _image_success, "Bot image fetch failed", tags or "", 1)
+
+                _run_bot_request(
+                    self.api_client.start_bot_stream,
+                    _start_success,
+                    "Failed to start stream",
+                    self.current_room,
+                    interval,
+                    tags,
                 )
-                # Immediately fetch and display the first bot image after stream starts
-                def _image_success(img_result):
-                    # img_result is the payload from fetch_bot_images
-                    if not img_result or not isinstance(img_result, dict):
-                        self.append_system_message("Failed to fetch initial bot image.")
-                        return
-                    images = img_result.get("images") or img_result.get("results") or []
-                    if not images:
-                        self.append_system_message("No bot images available.")
-                        return
-                    # Use the first image
-                    image = images[0]
-                    image_url = image.get("url") or image.get("file_url")
-                    image_tags = image.get("tags")
-                    pretty_tags = image_tags if image_tags else "(no tags)"
-                    payload = f"Tags: {pretty_tags}\n{image_url}"
-                    if self.websocket_thread and self.websocket_thread.client:
-                        self.websocket_thread.send_message(payload)
-                        self.append_system_message("Bot image sent to room.")
-                    else:
-                        self.append_system_message(payload)
 
-                # Use the same tags as the stream, or None
-                _run_bot_request(self.api_client.fetch_bot_images, _image_success, "Bot image fetch failed", tags or "", 1)
-
+            # Stop the stream first, then start
             _run_bot_request(
-                self.api_client.start_bot_stream,
-                _start_success,
-                "Failed to start stream",
+                self.api_client.stop_bot_stream,
+                _after_stop,
+                "Failed to stop stream before starting new one",
                 self.current_room,
-                interval,
-                tags,
             )
             return
 
