@@ -1043,16 +1043,26 @@ class LoginDialog(QDialog):
             QMessageBox.critical(self, "Registration Failed", str(result))
 
 
+
 class ChatBrowser(QTextBrowser):
     """QTextBrowser that serves images from an in-memory bytes store via loadResource,
     avoiding large base64 data URIs in the HTML document."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._workers = []  # Prevent WorkerThread instances from being garbage-collected mid-run
 
     # Class-level bytes store: {"chatimg://<key>": bytes}
     _image_store: Dict[str, bytes] = {}
 
     def loadResource(self, resource_type, url):
         if resource_type == 2:  # QTextDocument.ResourceType.ImageResource
-            key = url.toString()
+            # Normalize key: strip ?retry=... for cache lookup
+            from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+            key_url = url.toString()
+            parsed = urlparse(key_url)
+            query = [(k, v) for k, v in parse_qsl(parsed.query) if k != 'retry']
+            norm_url = urlunparse(parsed._replace(query=urlencode(query)))
+            key = norm_url
             # Use a retry counter in the URL query (?retry=N)
             retry_count = 0
             if url.hasQuery():
@@ -1068,9 +1078,7 @@ class ChatBrowser(QTextBrowser):
                 img = QImage()
                 if not img.loadFromData(data):
                     print(f"[ERROR] Failed to load image data for key: {key}")
-                    # Retry up to 2 times if not already retried
                     if retry_count < 2:
-                        # Re-request with incremented retry count
                         new_url = QUrl(url)
                         q = new_url.query()
                         if 'retry=' in q:
@@ -1081,45 +1089,40 @@ class ChatBrowser(QTextBrowser):
                         return self.loadResource(resource_type, new_url)
                     return self._fallback_image()
                 return img
-            # Lazy load: try to fetch and cache the image if not present
-            parent = self.parent()
-            while parent and not hasattr(parent, '_cache_image_url'):
-                parent = parent.parent() if hasattr(parent, 'parent') else None
-            if parent and hasattr(parent, '_cache_image_url'):
-                # Try to find the original URL from the key
-                for url_str, cache_key in getattr(parent, '_image_cache', {}).items():
-                    if cache_key == key:
-                        parent._cache_image_url(url_str)
-                        data = ChatBrowser._image_store.get(key)
-                        if data is not None:
-                            from PyQt6.QtGui import QImage
-                            img = QImage()
-                            if not img.loadFromData(data):
-                                print(f"[ERROR] Failed to load image data for key (lazy): {key}")
-                                # Retry up to 2 times if not already retried
-                                if retry_count < 2:
-                                    new_url = QUrl(url)
-                                    q = new_url.query()
-                                    if 'retry=' in q:
-                                        q = '&'.join([p if not p.startswith('retry=') else f'retry={retry_count+1}' for p in q.split('&')])
-                                    else:
-                                        q = (q + '&' if q else '') + f'retry={retry_count+1}'
-                                    new_url.setQuery(q)
-                                    return self.loadResource(resource_type, new_url)
-                                return self._fallback_image()
-                            return img
-                        break
-            print(f"[ERROR] Image not found in cache for key: {key}")
-            # Retry up to 2 times if not already retried
-            if retry_count < 2:
-                new_url = QUrl(url)
-                q = new_url.query()
-                if 'retry=' in q:
-                    q = '&'.join([p if not p.startswith('retry=') else f'retry={retry_count+1}' for p in q.split('&')])
-                else:
-                    q = (q + '&' if q else '') + f'retry={retry_count+1}'
-                new_url.setQuery(q)
-                return self.loadResource(resource_type, new_url)
+            # If not in cache, fetch and cache the image from the URL in a background thread
+            def fetch_and_cache():
+                try:
+                    import requests
+                    response = requests.get(parsed.geturl(), timeout=8)
+                    if response.status_code == 200:
+                        ChatBrowser._image_store[key] = response.content
+                        # Trigger a repaint of the document to show the image
+                        self.document().addResource(resource_type, url, response.content)
+                        self.viewport().update()
+                    else:
+                        print(f"[ERROR] Failed to fetch image from URL: {parsed.geturl()} (status {response.status_code})")
+                except Exception as e:
+                    print(f"[ERROR] Exception fetching image from URL: {parsed.geturl()} - {e}")
+            # Only start a background fetch if not already fetching for this key
+            if not hasattr(self, '_fetching_keys'):
+                self._fetching_keys = set()
+            if key not in self._fetching_keys:
+                self._fetching_keys.add(key)
+                from PyQt6.QtCore import QTimer
+                from PyQt6.QtWidgets import QApplication
+                worker = WorkerThread(fetch_and_cache)
+                self._workers.append(worker)
+                def on_done(_):
+                    self._fetching_keys.discard(key)
+                    # Remove finished worker from list
+                    try:
+                        self._workers.remove(worker)
+                    except ValueError:
+                        pass
+                    # Trigger a repaint after image is fetched
+                    QTimer.singleShot(0, self.viewport().update)
+                worker.result.connect(on_done)
+                worker.start()
             return self._fallback_image()
         return super().loadResource(resource_type, url)
 
