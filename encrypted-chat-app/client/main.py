@@ -2899,12 +2899,17 @@ class ChatWindow(QMainWindow):
                 return
 
             tags = start_parts[1].strip() if len(start_parts) > 1 else None
-            # If tags are not provided, use saved/start tags from config or last used
+            # If tags are not provided, use saved/start tags from config or last used, but only if they are non-empty
             if not tags:
-                # Try to get saved tags from user settings or last used
-                tags = ','.join(getattr(self, 'saved_tags', []) or getattr(self, 'start_tags', []) or [])
-                if not tags:
-                    # No tags provided and no saved tags: use random mode (empty string)
+                saved_tags = getattr(self, 'saved_tags', []) or []
+                start_tags = getattr(self, 'start_tags', []) or []
+                # Only use saved/start tags if they are non-empty
+                if saved_tags:
+                    tags = ','.join(saved_tags)
+                elif start_tags:
+                    tags = ','.join(start_tags)
+                else:
+                    # No tags provided and no saved tags: use random mode (None)
                     tags = None
             # Only add tags to taglist if they were explicitly provided
             if tags and start_parts[1:]:
